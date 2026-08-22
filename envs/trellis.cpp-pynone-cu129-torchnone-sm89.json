@@ -1,0 +1,13 @@
+{
+  "name": "trellis.cpp",
+  "source": "pwilkin/trellis.cpp",
+  "commit": "16f3109e82f3922033bfa62b83c42899678b7b6f",
+  "python": null,
+  "cuda": "12.9.1",
+  "pytorch": null,
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "ubuntu": "22.04",
+  "backend": "GGML_CUDA",
+  "artifacts": ["trellis-server", "trellis-cli", "libggml*.so", "CUDA runtime libraries"]
+}
