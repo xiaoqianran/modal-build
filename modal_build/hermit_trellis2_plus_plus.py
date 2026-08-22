@@ -8,12 +8,12 @@ from pathlib import Path
 
 import modal
 
-TAG = "trellis2-py311-cu124-torch260-sm89-v1"
+TAG = "hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v1"
 REPO = "xiaoqianran/modal-build"
 WHEELHOUSE = Path("/tmp/wheelhouse")
 OUT = Path("/tmp/out")
 
-app = modal.App("modal-build-trellis2")
+app = modal.App("modal-build-hermit-trellis2-plus-plus")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.4.1-devel-ubuntu22.04", add_python="3.11")

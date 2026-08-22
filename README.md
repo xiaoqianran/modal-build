@@ -11,7 +11,7 @@ Each release is keyed by Python/CUDA/PyTorch/CUDA-architecture compatibility and
 
 ## TRELLIS2 / L40S
 
-Environment: `trellis2-py311-cu124-torch260-sm89-v1`
+Environment: `hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v1`
 
 - Python 3.11
 - Ubuntu 22.04
@@ -23,7 +23,7 @@ Environment: `trellis2-py311-cu124-torch260-sm89-v1`
 Build and publish from Modal:
 
 ```bash
-modal run -m modal_build.trellis2::build_and_release
+modal run -m modal_build.hermit_trellis2_plus_plus::build_and_release
 ```
 
 The function is hard-limited to one L40S container and publishes using the Modal Secret

@@ -1,5 +1,5 @@
 {
-  "name": "trellis2",
+  "name": "hermit-trellis2-plus-plus",
   "python": "3.11",
   "cuda": "12.4.1",
   "pytorch": "2.6.0",
