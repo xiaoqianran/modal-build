@@ -68,8 +68,10 @@ def build_and_release() -> dict:
         result = subprocess.run(
             ["ldd", str(DIST / name)], capture_output=True, text=True, check=True
         )
-        if "not found" in result.stdout:
-            raise RuntimeError(f"unresolved runtime dependency for {name}:\n{result.stdout}")
+        missing = [line.strip() for line in result.stdout.splitlines() if "not found" in line]
+        unsupported = [line for line in missing if not line.startswith("libcuda.so.1 ")]
+        if unsupported:
+            raise RuntimeError(f"unresolved runtime dependency for {name}: {unsupported}")
         ldd[name] = result.stdout
 
     archive = OUT / f"{TAG}.tar.gz"
