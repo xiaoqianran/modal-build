@@ -20,7 +20,8 @@ app = modal.App("modal-build-trellis.cpp")
 
 image = (
     modal.Image.from_registry("nvidia/cuda:12.9.1-devel-ubuntu22.04", add_python="3.11")
-    .apt_install("git", "gh", "cmake", "ninja-build", "patchelf", "build-essential", "curl", "ca-certificates")
+    .apt_install("git", "gh", "patchelf", "build-essential", "curl", "ca-certificates", "ccache")
+    .run_commands("python -m pip install --upgrade uv", "uv pip install --system cmake ninja")
 )
 
 
