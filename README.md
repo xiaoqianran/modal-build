@@ -37,7 +37,7 @@ redistribution permission. This repository is for build tooling and redistributa
 
 ## trellis.cpp / L40S
 
-Environment: `trellis.cpp-pynone-cu129-torchnone-sm89-v1`
+Environment: `trellis.cpp-pynone-cu129-torchnone-sm89-v2`
 
 - Native C++17 / GGML runtime (no Python or PyTorch at inference time)
 - Ubuntu 22.04

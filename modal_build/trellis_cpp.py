@@ -2,14 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
 
 import modal
 
-TAG = "trellis.cpp-pynone-cu129-torchnone-sm89-v1"
+TAG = "trellis.cpp-pynone-cu129-torchnone-sm89-v2"
 REPO = "xiaoqianran/modal-build"
 COMMIT = "16f3109e82f3922033bfa62b83c42899678b7b6f"
 OUT = Path("/tmp/out")
@@ -56,21 +55,22 @@ def build_and_release() -> dict:
     for p in (SRC / "build").glob("libggml*.so*"):
         shutil.copy2(p, DIST / p.name)
 
-    cuda_lib = Path("/usr/local/cuda/lib64")
-    for stem in ("libcudart.so", "libcublas.so", "libcublasLt.so"):
-        matches = sorted(cuda_lib.glob(stem + "*"))
-        if not matches:
-            raise RuntimeError(f"missing CUDA runtime library: {stem}")
-        for p in matches:
-            target = DIST / p.name
-            if p.is_symlink():
-                target.symlink_to(os.readlink(p))
-            elif not target.exists():
-                shutil.copy2(p, target)
+    # CUDA runtime is supplied by the pinned NVIDIA runtime image.
+    # Bundle only our compiled artifacts.
+
 
     for p in DIST.iterdir():
         if p.is_file() and not p.is_symlink():
             subprocess.run(["patchelf", "--set-rpath", "$ORIGIN", str(p)], check=False)
+
+    ldd = {}
+    for name in ("trellis-server", "trellis-cli"):
+        result = subprocess.run(
+            ["ldd", str(DIST / name)], capture_output=True, text=True, check=True
+        )
+        if "not found" in result.stdout:
+            raise RuntimeError(f"unresolved runtime dependency for {name}:\n{result.stdout}")
+        ldd[name] = result.stdout
 
     archive = OUT / f"{TAG}.tar.gz"
     sh(f"tar -C '{DIST}' -czf '{archive}' .")
@@ -84,6 +84,8 @@ def build_and_release() -> dict:
         "cuda_arch": "8.9",
         "target_gpu": "L40S",
         "backend": "GGML_CUDA",
+        "runtime_base": "nvidia/cuda:12.9.1-runtime-ubuntu22.04 + libgomp1",
+        "ldd": ldd,
         "archive_bytes": archive.stat().st_size,
         "archive_sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
         "files": [],
