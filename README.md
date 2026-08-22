@@ -45,8 +45,10 @@ Environment: `trellis.cpp-pynone-cu129-torchnone-sm89-v2`
 - CUDA arch 8.9 (Ada / L40S)
 - Source pinned to `pwilkin/trellis.cpp@16f3109e82f3922033bfa62b83c42899678b7b6f`
 
-The release bundle contains the resident HTTP server, CLI, GGML shared libraries, and CUDA runtime
-libraries. Model GGUF files are intentionally stored separately in Modal Volume.
+The release bundle contains the resident HTTP server, CLI, and GGML shared libraries. CUDA runtime
+libraries are supplied by the pinned NVIDIA runtime image, while `libcuda.so.1` is provided by the
+NVIDIA driver / Modal GPU host at container startup. Model GGUF files are intentionally stored
+separately in Modal Volume.
 
 ## Pixal3D / L40S
 
