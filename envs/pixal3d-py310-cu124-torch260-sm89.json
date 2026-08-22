@@ -1,0 +1,22 @@
+{
+  "name": "pixal3d",
+  "source": "TencentARC/Pixal3D",
+  "commit": "cdbb2bbffbf4e6f298b5f2af3d1d76a8d823d2af",
+  "python": "3.10",
+  "cuda": "12.4.1",
+  "pytorch": "2.6.0",
+  "torchvision": "0.21.0",
+  "triton": "3.2.0",
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "ubuntu": "22.04",
+  "attention": "sdpa+natten-0.21.0",
+  "artifacts": [
+    "nvdiffrast",
+    "nvdiffrec_render",
+    "flex_gemm",
+    "cumesh",
+    "o_voxel",
+    "natten==0.21.0"
+  ]
+}

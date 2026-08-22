@@ -47,3 +47,16 @@ Environment: `trellis.cpp-pynone-cu129-torchnone-sm89-v2`
 
 The release bundle contains the resident HTTP server, CLI, GGML shared libraries, and CUDA runtime
 libraries. Model GGUF files are intentionally stored separately in Modal Volume.
+
+## Pixal3D / L40S
+
+Environment: `pixal3d-py310-cu124-torch260-sm89-v1`
+
+- Python 3.10
+- CUDA 12.4.1
+- PyTorch 2.6.0 / torchvision 0.21.0 / Triton 3.2.0
+- CUDA arch 8.9 (Ada / L40S)
+- NATTEN 0.21.0
+- Source-built `nvdiffrast`, `nvdiffrec_render`, `flex_gemm`, `cumesh`, `o_voxel`, `natten`
+
+Runtime workers consume the Release zip with `uv`; they do not compile CUDA extensions.
