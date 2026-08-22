@@ -42,18 +42,18 @@ def build_and_release() -> dict:
     env = "CC=gcc CXX=g++ TORCH_CUDA_ARCH_LIST=8.9 MAX_JOBS=4"
 
     # Build distributable wheels once. Runtime images install these instead of recompiling CUDA.
-    sh(f"{env} python -m pip wheel flash-attn==2.7.3 --no-build-isolation -w {WHEELHOUSE}")
+    sh(f"{env} python -m pip wheel flash-attn==2.7.3 --no-build-isolation --no-deps -w {WHEELHOUSE}")
 
     sh("git clone --recursive https://github.com/JeffreyXiang/CuMesh.git /tmp/CuMesh")
-    sh(f"{env} python -m pip wheel . --no-build-isolation -w {WHEELHOUSE}", "/tmp/CuMesh")
+    sh(f"{env} python -m pip wheel . --no-build-isolation --no-deps -w {WHEELHOUSE}", "/tmp/CuMesh")
 
     sh("git clone --recursive https://github.com/JeffreyXiang/FlexGEMM.git /tmp/FlexGEMM")
-    sh(f"{env} python -m pip wheel . --no-build-isolation -w {WHEELHOUSE}", "/tmp/FlexGEMM")
+    sh(f"{env} python -m pip wheel . --no-build-isolation --no-deps -w {WHEELHOUSE}", "/tmp/FlexGEMM")
 
     sh("git clone https://github.com/Archerkattri/hermit-trellis2-plus-plus.git /tmp/hermit")
     sh("git checkout 2c8402a92ea97c510c09e278fae557771aad774d", "/tmp/hermit")
     sh("git submodule update --init --recursive", "/tmp/hermit")
-    sh(f"{env} python -m pip wheel ./o-voxel --no-build-isolation -w {WHEELHOUSE}", "/tmp/hermit")
+    sh(f"{env} python -m pip wheel ./o-voxel --no-build-isolation --no-deps -w {WHEELHOUSE}", "/tmp/hermit")
 
     manifest = {
         "tag": TAG,
