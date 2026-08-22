@@ -1,0 +1,16 @@
+{
+  "name": "trellis2",
+  "python": "3.11",
+  "cuda": "12.4.1",
+  "pytorch": "2.6.0",
+  "torchvision": "0.21.0",
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "ubuntu": "22.04",
+  "artifacts": [
+    "flash-attn==2.7.3",
+    "CuMesh@JeffreyXiang/CuMesh",
+    "FlexGEMM@JeffreyXiang/FlexGEMM",
+    "o-voxel@Archerkattri/hermit-trellis2-plus-plus@2c8402a92ea97c510c09e278fae557771aad774d"
+  ]
+}

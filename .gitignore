@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+wheelhouse/
+*.zip
+*.sha256
+.env
