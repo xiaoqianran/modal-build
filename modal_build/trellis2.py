@@ -53,6 +53,7 @@ def build_and_release() -> dict:
     sh("git clone https://github.com/Archerkattri/hermit-trellis2-plus-plus.git /tmp/hermit")
     sh("git checkout 2c8402a92ea97c510c09e278fae557771aad774d", "/tmp/hermit")
     sh("git submodule update --init --recursive", "/tmp/hermit")
+    sh("mkdir -p o-voxel/third_party && git clone https://gitlab.com/libeigen/eigen.git o-voxel/third_party/eigen && git -C o-voxel/third_party/eigen checkout e63d9f6ccb7f6f29f31241b87c542f3f0ab3112b", "/tmp/hermit")
     sh(f"{env} python -m pip wheel ./o-voxel --no-build-isolation --no-deps -w {WHEELHOUSE}", "/tmp/hermit")
 
     manifest = {
