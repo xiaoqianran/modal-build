@@ -1,6 +1,6 @@
 # modal-build
 
-Public, reproducible prebuilt wheel artifacts for Modal GPU workers.
+Reproducible CUDA/PyTorch build artifacts and production reference runtimes for Modal 3D workers.
 
 Large binary artifacts are stored as **GitHub Release assets**, not committed into Git history.
 Each release is keyed by Python/CUDA/PyTorch/CUDA-architecture compatibility and ships:
@@ -8,6 +8,54 @@ Each release is keyed by Python/CUDA/PyTorch/CUDA-architecture compatibility and
 - `*.wheels.zip` — prebuilt wheels
 - `*.manifest.json` — exact environment and per-wheel SHA256
 - `*.sha256` — archive checksum
+
+
+## Repository layers
+
+The repository separates three different lifecycle stages. They are related, but they do not call
+each other directly at runtime:
+
+```text
+modal_build/                 offline artifact builders
+    embodiedgen.py           builds/publishes pinned wheels and CUDA extension archives
+
+patches/                     source/runtime compatibility overlays
+    embodiedgen-v2.0.0/
+        production/          only files consumed by the current production runtime
+        legacy/              historical experiments kept for reproduction only
+
+runtime/                     deployable Modal applications
+    embodiedgen_v2_l40s.py   current EmbodiedGen Image→3D production runtime/API
+    legacy/                  historical runtime variants
+```
+
+For EmbodiedGen, the lifecycle is:
+
+```text
+modal_build/embodiedgen.py
+        │
+        └── build binary artifacts (CPU host + nvcc, no paid GPU)
+                │
+                ▼
+        GitHub Release assets
+                │
+────────────────┼────────────────────────────────────
+                │
+                ▼
+runtime/embodiedgen_v2_l40s.py
+        │
+        ├── clone exact upstream EmbodiedGen commit
+        ├── verify/download the prebuilt Release artifacts
+        ├── apply patches/embodiedgen-v2.0.0/production/*
+        └── deploy the Modal production workers/API
+```
+
+`modal_build/embodiedgen.py` intentionally does **not** import or execute files from `patches/`:
+the builder produces reusable binary artifacts, while the production runtime consumes those
+artifacts and applies runtime compatibility patches in a later image-build stage.
+
+The milestone tag `embodiedgen-v2.0.0-image-to-3d-modal-v1` marks completion of the validated
+Image→3D production pipeline. It is a Git tag only, not a GitHub Release.
 
 ## TRELLIS2 / L40S
 
@@ -45,8 +93,9 @@ Environment: `embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1`
 
 The build itself is **CPU-only**: the CUDA devel image provides `nvcc`, and
 `TORCH_CUDA_ARCH_LIST=8.9` targets L40S without renting a GPU.  A real L40S is used only for the
-end-to-end validation run.  The validated headless runtime patches are under
-`patches/embodiedgen-v2.0.0/`, with the Modal runner under `runtime/embodiedgen_v2_l40s.py`.
+end-to-end validation run.  The validated production runtime patches are under
+`patches/embodiedgen-v2.0.0/production/`, with the Modal runner under
+`runtime/embodiedgen_v2_l40s.py`. Historical patch/runtime variants are isolated under `legacy/`.
 
 Build and publish:
 

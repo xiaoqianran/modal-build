@@ -40,7 +40,7 @@ GitHub Release. Weights live on `modal-3d-embodiedgen-weights`; per-job intermed
 `runtime/embodiedgen_v2_l40s.py` is the production-style consumer. It downloads the release
 artifacts and cannot compile CUDA because the image has no `nvcc`.
 
-`runtime/embodiedgen_v2_l40s_fullbuild.py` is retained only as the fully reproducible historical
+`runtime/legacy/embodiedgen_v2_l40s_fullbuild.py` is retained only as the fully reproducible historical
 builder/validation path. It contains CUDA build steps and should not be used for normal inference.
 
 ## Headless patches

@@ -460,7 +460,7 @@ image = (
 # Apply only the validated headless/source patches after all packages are installed.
 image = (
     image
-    .add_local_file("patches/embodiedgen-v2.0.0/headless-l40s.patch", "/tmp/headless-l40s.patch", copy=True)
+    .add_local_file("patches/embodiedgen-v2.0.0/production/headless-l40s.patch", "/tmp/headless-l40s.patch", copy=True)
     .run_commands(
         "cd /workspace/EmbodiedGen && git apply /tmp/headless-l40s.patch",
         "cd /workspace/EmbodiedGen && grep -RIl '@spaces.GPU' embodied_gen --include='*.py' | xargs -r sed -i '/^[[:space:]]*@spaces.GPU[[:space:]]*$/d'",
@@ -475,12 +475,12 @@ image = (
 image = (
     image
     .add_local_file(
-        "patches/embodiedgen-v2.0.0/patch_nvdiffrast_init_release.py",
+        "patches/embodiedgen-v2.0.0/production/patch_nvdiffrast_init_release.py",
         "/tmp/patch_nvdiffrast_init_release.py",
         copy=True,
     )
     .add_local_file(
-        "patches/embodiedgen-v2.0.0/gsplat_backend_release.py",
+        "patches/embodiedgen-v2.0.0/production/gsplat_backend_release.py",
         "/usr/local/lib/python3.10/site-packages/gsplat/cuda/_backend.py",
         copy=True,
     )
