@@ -25,7 +25,7 @@ patches/                     source/runtime compatibility overlays
         legacy/              historical experiments kept for reproduction only
 
 runtime/                     deployable Modal applications
-    embodiedgen_v2_l40s.py   current EmbodiedGen Image→3D production runtime/API
+    embodiedgen_v2_l40s.py   current EmbodiedGen Image→3D / Text→3D / Retexture runtime/API
     legacy/                  historical runtime variants
 ```
 
@@ -62,6 +62,11 @@ Text→Image L40S stage generates the conditioning image and then reuses the exa
 Image→3D pipeline. A full authenticated production Text→3D E2E has passed with GLB/video/validation
 HTTP downloads and zero traceback/OOM/runtime-warning matches. See `docs/embodiedgen.md` for the
 pinned model revision, timings and measured cold validation cost.
+
+It also exposes `POST /jobs/{source_job_id}/retexture` for prompt-driven appearance edits of an
+existing successful asset. Retexture reuses the pinned Kolors snapshot plus only ~393 MiB of pinned
+RoboAssetGen ControlNet/RealESRGAN weights, preserves geometry, and has passed an authenticated
+production E2E with OBJ/MTL/texture/GLB/video downloads and zero GPT-init/UV/traceback/OOM warnings.
 
 ## TRELLIS2 / L40S
 

@@ -1150,3 +1150,62 @@ Measured Modal cost for that warning-free cold/dev Retexture E2E was `$0.0767393
 `$0.06167654` L40S, `$0.00672025` CPU and `$0.00834258` memory. This is a cold/dev baseline rather
 than a warm per-edit SLA. The independent `min_cost` Retexture autoscale tail is only about
 `$0.00133067` for its 2-second scaledown window.
+
+### Production Retexture E2E
+
+Commit `6ce88c8` was deployed to the production `modal-3d-embodiedgen` app. The authenticated
+production endpoint then retextured source job `job-b9575d82101c4a0da29e9b0706293233` with:
+
+```text
+prompt: satin black ceramic with a thin copper rim
+seed: 2
+profile: min_cost
+```
+
+The production job `job-f82e3eaab6a846e08d32874788495b80` completed successfully:
+
+```text
+POST /jobs/{source}/retexture   202
+resident model load             15.725 s
+condition render                 2.208 s
+texture diffusion               27.820 s
+backprojection                  12.637 s
+preview render                   2.772 s
+worker method                   52.829 s
+orchestrator stage wall         96.521 s
+status                          succeeded
+
+source OBJ faces                50,000
+output OBJ faces                50,000
+output OBJ vertices             28,519
+PLY Gaussian vertices           76,404
+GLB geometries                       1
+source_geometry_preserved         true
+material references                OK
+```
+
+Authenticated file downloads all returned HTTP 200:
+
+```text
+validation                         778 bytes
+GLB                          1,971,848 bytes
+video                          174,379 bytes
+OBJ                          3,556,518 bytes
+MTL                                200 bytes
+texture                        791,201 bytes
+```
+
+Production logs from submission through all downloads contained:
+
+```text
+Using GPT model                              0
+Missing uvmap; cannot texturemap materials  0
+Traceback                                    0
+OOM / out of memory                          0
+```
+
+The production app's `21:00 UTC` hourly billing bucket, containing this redeploy plus the Retexture
+request/polling/downloads, measured **$0.07285121** total: `$0.05853005` L40S, `$0.00639499` CPU and
+`$0.00792617` memory. Treat this as the current production cold-validation baseline, not a warm SLA.
+The result remains under the normal API retention policy and will be cleaned by the existing TTL
+sweeper.
