@@ -42,6 +42,19 @@ class AutoscalePolicyTest(unittest.TestCase):
         self.assertEqual(summary["scaledown_window_seconds"]["sam3d"], 30)
         self.assertEqual(summary["scaledown_window_seconds"]["finalize"], 2)
 
+    def test_text_profile_cost_includes_text2image_tail(self):
+        summary = runtime.text_autoscale_profile_summary("min_cost")
+        self.assertEqual(summary["text2image_scaledown_window_seconds"], 2)
+        self.assertAlmostEqual(summary["text2image_idle_tail_usd"], 0.00133067, places=8)
+        self.assertAlmostEqual(summary["text_to_3d_idle_tail_total_usd"], 0.00433439, places=8)
+
+    def test_text_cost_first_tail_is_separate_from_image_cost(self):
+        image = runtime.autoscale_profile_summary("cost_first")
+        text = runtime.text_autoscale_profile_summary("cost_first")
+        self.assertAlmostEqual(image["idle_tail_total_usd"], 0.03065400, places=8)
+        self.assertAlmostEqual(text["text2image_idle_tail_usd"], 0.01996000, places=8)
+        self.assertAlmostEqual(text["text_to_3d_idle_tail_total_usd"], 0.05061400, places=8)
+
     def test_unknown_profile_fails_closed(self):
         with self.assertRaises(ValueError):
             runtime.autoscale_profile_summary("unknown")

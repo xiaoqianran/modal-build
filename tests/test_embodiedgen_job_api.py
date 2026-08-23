@@ -104,6 +104,54 @@ class InputResolutionTest(unittest.TestCase):
 
 
 
+class TextJobTest(unittest.TestCase):
+    def test_prompt_validation(self):
+        self.assertEqual(runtime.normalize_text_prompt("  red mug  "), "red mug")
+        with self.assertRaises(TypeError):
+            runtime.normalize_text_prompt(None)
+        for value in ("", "   ", "x" * (runtime.MAX_PROMPT_CHARS + 1)):
+            with self.subTest(value=value[:16]), self.assertRaises(ValueError):
+                runtime.normalize_text_prompt(value)
+
+    def test_generated_text_input_is_labeled_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "input_image").write_bytes(b"png")
+            (root / "prompt.txt").write_text("red mug\n")
+            path, source = runtime.resolve_job_input(runtime.new_job_id(), root, Path("fallback.jpg"))
+            self.assertEqual(path, root / "input_image")
+            self.assertEqual(source, "generated-text")
+
+    def test_text_worker_is_l40s_and_offline(self):
+        source = RUNTIME.read_text()
+        pos = source.index("class Text2ImageWorker:")
+        decorator = source[source.rfind("@app.cls(", 0, pos):pos]
+        body_end = source.index("def _rembg_load", pos)
+        body = source[pos:body_end]
+        self.assertIn('image=image', decorator)
+        self.assertIn('gpu="L40S"', decorator)
+        self.assertIn('local_files_only=True', body)
+        self.assertIn('HF_HUB_OFFLINE', body)
+        self.assertIn('TRANSFORMERS_OFFLINE', body)
+
+    def test_text_stage_runs_before_rembg(self):
+        source = RUNTIME.read_text()
+        start = source.index("def run_job(")
+        end = source.index("@app.function(", start)
+        body = source[start:end]
+        self.assertLess(body.index('"text2image"'), body.index('"rembg"'))
+
+    def test_text_submit_uses_async_modal_interfaces(self):
+        source = RUNTIME.read_text()
+        start = source.index("    async def submit_text_job(")
+        end = source.index('    @web.get("/jobs/{job_id}")', start)
+        submit = source[start:end]
+        for blocking in ("artifacts.commit()", "job_states.put(", "run_job.spawn("):
+            self.assertNotIn(blocking, submit)
+        for async_call in ("artifacts.commit.aio()", "job_states.put.aio(", "run_job.spawn.aio("):
+            self.assertIn(async_call, submit)
+
+
 class AutoscaleDedupeTest(unittest.TestCase):
     class FakeTarget:
         def __init__(self):

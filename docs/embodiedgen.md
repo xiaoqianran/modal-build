@@ -917,3 +917,73 @@ Traceback                          0 matches
 
 This closes the earlier two warnings: normal CPU stages no longer use a CUDA base image, and the
 ASGI submit path no longer invokes blocking Modal interfaces from an async context.
+
+## Phase 2: Text→3D via pinned Kolors + existing Image→3D
+
+The first Text→3D production path deliberately reuses the validated Image→3D asset pipeline instead
+of introducing a second 3D backend. Upstream EmbodiedGen already supports this composition:
+
+```text
+text prompt
+    ↓
+Kolors Text→Image (L40S)
+    ↓
+1024×1024 generated image
+    ↓
+existing Rembg → SAM3D → Mesh → Lite texture → Finalize pipeline
+    ↓
+OBJ / GLB / URDF / video / validation
+```
+
+The public Kolors snapshot is pinned exactly to
+`Kwai-Kolors/Kolors-diffusers@7e091c75199e910a26cd1b51ed52c28de5db3711` (16.597 GiB).
+A separate CPU-only preload stores it under `/weights/text2img/kolors-diffusers`; the paid L40S
+worker runs with `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, and `local_files_only=True`.
+This keeps model download/network waits off paid GPU time and does not force Image→3D-only users to
+preload the text model.
+
+The API adds `POST /text-jobs` while preserving the existing `POST /jobs` Image→3D contract. The
+Text→Image stage writes the generated PNG to the existing `input_image` job slot, after which all
+five validated Image→3D stages are reused unchanged. Prompt length is capped at 1,000 characters and
+seed at integer `0..100000`.
+
+### Real dev E2E validation
+
+A proxy-authenticated dev endpoint accepted:
+
+```text
+prompt: "a small red ceramic mug with one curved handle, isolated object, simple clean shape"
+profile: min_cost
+seed: 0
+```
+
+and completed `job-2efa8e3245324eadbc73cba08251ce54` end to end:
+
+```text
+POST /text-jobs                 202
+Text2Image Kolors               load 24.255 s, generate 15.251 s, 1024×1024
+Rembg                           source=generated-text, remove 1.440 s
+SAM3D L40S                      load 50.248 s, inference 17.727 s, method 21.470 s
+Mesh CPU                        714,128 → 50,000 faces, simplify 0.984 s, xatlas 4.216 s
+Lite L40S                       render24 0.250 s, bake 1.181 s, total 4.323 s
+Finalize                        validation 5.995 s
+status                          succeeded
+validation download             HTTP 200
+GLB download                    HTTP 200, 1,901,576 bytes
+video download                  HTTP 200, 55,757 bytes
+```
+
+Final structural validation reported 76,404 Gaussian vertices, 28,890 OBJ vertices, exactly 50,000
+OBJ faces, one GLB geometry, valid URDF/video/material references, and successful intermediate
+cleanup. Dev logs contained zero `AsyncUsageWarning`, zero CPU CUDA-driver warnings and zero
+tracebacks.
+
+Modal billing for this deliberately cold dev E2E was **$0.17048120** (`$0.13082132` L40S,
+`$0.02120097` CPU, `$0.01845891` memory). The one-stage cold Text→Image smoke was $0.04936441.
+The 17 GiB CPU-only weight preload cost $0.00676091 and had no paid GPU charge.
+
+Text→3D keeps a separate idle-tail model so the existing Image→3D cost numbers stay comparable. The
+Text2Image worker allocates L40S + 4 CPU + 32 GiB, or about **$2.3952/h** at the current workspace
+rates. `min_cost` adds only about **$0.00133067** of Text2Image tail, making the full Text→3D isolated
+idle-tail ceiling about **$0.00433439**. `cost_first` adds about **$0.01996** of Text2Image tail, for a
+combined Text→3D idle-tail ceiling of about **$0.05061400**.

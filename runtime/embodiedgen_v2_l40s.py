@@ -32,6 +32,17 @@ MAX_INPUT_PIXELS = 40_000_000
 API_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
 API_FAILED_TTL_SECONDS = 24 * 60 * 60
 API_ACTIVE_STALE_SECONDS = 6 * 60 * 60
+MAX_PROMPT_CHARS = 1000
+TEXT2IMG_MODEL_ID = "Kwai-Kolors/Kolors-diffusers"
+TEXT2IMG_MODEL_REVISION = "7e091c75199e910a26cd1b51ed52c28de5db3711"
+TEXT2IMG_MODEL_DIR = "/weights/text2img/kolors-diffusers"
+TEXT2IMG_REVISION_MARKER = ".modal-build-revision"
+TEXT2IMG_SCALEDOWN_WINDOWS = {
+    "min_cost": 2,
+    "cost_first": 30,
+    "balanced": 90,
+    "burst": 180,
+}
 
 STATIC_AUTOSCALE_PROFILE = "cost_first"
 DEFAULT_REQUEST_PROFILE = "auto"
@@ -56,6 +67,7 @@ RESOURCE_HOURLY_COST = {
     "mesh": 4 * RATE_CPU_CORE_HOUR + 8 * RATE_MEMORY_GIB_HOUR,
     "lite": RATE_L40S_HOUR + 4 * RATE_CPU_CORE_HOUR + 16 * RATE_MEMORY_GIB_HOUR,
     "finalize": 4 * RATE_CPU_CORE_HOUR + 16 * RATE_MEMORY_GIB_HOUR,
+    "text2image": RATE_L40S_HOUR + 4 * RATE_CPU_CORE_HOUR + 32 * RATE_MEMORY_GIB_HOUR,
 }
 
 
@@ -72,6 +84,23 @@ def autoscale_profile_summary(name: str) -> dict:
         "scaledown_window_seconds": dict(windows),
         "idle_tail_cost_usd": {k: round(v, 8) for k, v in idle_tail.items()},
         "idle_tail_total_usd": round(sum(idle_tail.values()), 8),
+    }
+
+
+def text_autoscale_profile_summary(name: str) -> dict:
+    """Idle-tail ceiling for Text→Image plus the existing Image→3D pipeline."""
+    image_summary=autoscale_profile_summary(name)
+    seconds=TEXT2IMG_SCALEDOWN_WINDOWS[name]
+    text_tail=RESOURCE_HOURLY_COST["text2image"] / 3600.0 * seconds
+    return {
+        "profile":name,
+        "image_to_3d_idle_tail_usd":image_summary["idle_tail_total_usd"],
+        "text2image_scaledown_window_seconds":seconds,
+        "text2image_idle_tail_usd":round(text_tail,8),
+        "text_to_3d_idle_tail_total_usd":round(
+            image_summary["idle_tail_total_usd"]+text_tail,
+            8,
+        ),
     }
 
 
@@ -124,6 +153,17 @@ def select_request_profile(requested: str = DEFAULT_REQUEST_PROFILE, now: float 
     }
 
 
+def normalize_text_prompt(value: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError("prompt must be a string")
+    prompt = value.strip()
+    if not prompt:
+        raise ValueError("prompt must not be empty")
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise ValueError(f"prompt exceeds {MAX_PROMPT_CHARS} characters")
+    return prompt
+
+
 def new_job_id() -> str:
     import uuid
 
@@ -147,8 +187,9 @@ def resolve_job_input(job_id: str, root: Path, fallback: Path) -> tuple[Path, st
     uploaded = root / "input_image"
     if is_api_job_id(job_id):
         if not uploaded.is_file():
-            raise FileNotFoundError(f"missing uploaded image for API job {job_id}")
-        return uploaded, "uploaded"
+            raise FileNotFoundError(f"missing uploaded/generated image for API job {job_id}")
+        source = "generated-text" if (root / "prompt.txt").is_file() else "uploaded"
+        return uploaded, source
     if uploaded.is_file():
         return uploaded, "uploaded"
     return fallback, "benchmark-sample"
@@ -381,6 +422,11 @@ job_states = modal.Dict.from_name("modal-3d-embodiedgen-jobs", create_if_missing
 control_image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "fastapi==0.116.1", "pillow==11.3.0"
 )
+text_weight_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .env({"HF_HOME": "/weights/hf", "PYTHONUNBUFFERED": "1"})
+    .pip_install("huggingface_hub==0.34.4")
+)
 cpu_image = (
     modal.Image.debian_slim(python_version="3.10")
     .env({"PYTHONUNBUFFERED": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
@@ -562,6 +608,147 @@ def preload_weights():
     info["seconds"] = round(time.perf_counter() - t0, 3)
     print("WEIGHTS_READY", json.dumps(info), flush=True)
     return info
+
+
+@app.function(
+    image=text_weight_image,
+    volumes={"/weights": weights},
+    timeout=60 * 60,
+    cpu=2.0,
+    memory=4096,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=2,
+)
+def preload_text2img_weights() -> dict:
+    """CPU-only pull of the exact public Kolors snapshot used by Text→3D."""
+    from huggingface_hub import snapshot_download
+
+    t0=time.perf_counter()
+    target=Path(TEXT2IMG_MODEL_DIR)
+    model_index=target/"model_index.json"
+    revision_marker=target/TEXT2IMG_REVISION_MARKER
+    current_revision=revision_marker.read_text().strip() if revision_marker.exists() else None
+    if not model_index.exists() or current_revision != TEXT2IMG_MODEL_REVISION:
+        target.mkdir(parents=True,exist_ok=True)
+        print(
+            f"CPU ONLY: syncing {TEXT2IMG_MODEL_ID}@{TEXT2IMG_MODEL_REVISION}",
+            flush=True,
+        )
+        snapshot_download(
+            repo_id=TEXT2IMG_MODEL_ID,
+            revision=TEXT2IMG_MODEL_REVISION,
+            local_dir=str(target),
+        )
+        revision_marker.write_text(TEXT2IMG_MODEL_REVISION+"\n")
+    weights.commit()
+    if not model_index.exists() or revision_marker.read_text().strip() != TEXT2IMG_MODEL_REVISION:
+        raise RuntimeError("text2img weights/revision marker incomplete")
+    info={
+        "model":TEXT2IMG_MODEL_ID,
+        "revision":TEXT2IMG_MODEL_REVISION,
+        "path":str(target),
+        "size_gib":round(sum(p.stat().st_size for p in target.rglob("*") if p.is_file())/1024**3,3),
+        "seconds":round(time.perf_counter()-t0,3),
+    }
+    print("TEXT2IMG_WEIGHTS_READY",json.dumps(info),flush=True)
+    return info
+
+
+@app.cls(
+    image=image,
+    gpu="L40S",
+    volumes={"/weights":weights,"/artifacts":artifacts},
+    cpu=4.0,
+    memory=32768,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=TEXT2IMG_SCALEDOWN_WINDOWS[STATIC_AUTOSCALE_PROFILE],
+    timeout=30*60,
+)
+class Text2ImageWorker:
+    """Pinned public Kolors Text→Image stage feeding the existing Image→3D pipeline."""
+
+    @modal.enter()
+    def load(self):
+        import torch
+        from diffusers import DPMSolverMultistepScheduler, KolorsPipeline
+
+        t0=time.perf_counter()
+        model_dir=Path(TEXT2IMG_MODEL_DIR)
+        model_index=model_dir/"model_index.json"
+        revision_marker=model_dir/TEXT2IMG_REVISION_MARKER
+        current_revision=revision_marker.read_text().strip() if revision_marker.exists() else None
+        if not model_index.exists() or current_revision != TEXT2IMG_MODEL_REVISION:
+            raise RuntimeError("Kolors weights/revision mismatch; run preload_text2img_weights first")
+        os.environ["HF_HUB_OFFLINE"]="1"
+        os.environ["TRANSFORMERS_OFFLINE"]="1"
+        pipe=KolorsPipeline.from_pretrained(
+            TEXT2IMG_MODEL_DIR,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            local_files_only=True,
+        ).to("cuda")
+        pipe.enable_model_cpu_offload()
+        pipe.enable_xformers_memory_efficient_attention()
+        pipe.scheduler=DPMSolverMultistepScheduler.from_config(
+            pipe.scheduler.config,
+            use_karras_sigmas=True,
+        )
+        self.pipe=pipe
+        self.load_seconds=time.perf_counter()-t0
+        print(
+            "TEXT2IMG_RESIDENT_READY "+json.dumps({
+                "model":TEXT2IMG_MODEL_ID,
+                "revision":TEXT2IMG_MODEL_REVISION,
+                "load_seconds":round(self.load_seconds,3),
+            }),
+            flush=True,
+        )
+
+    @modal.method()
+    def generate(self,job_id: str,prompt: str,seed: int=0) -> dict:
+        import torch
+        from embodied_gen.models.text_model import PROMPT_APPEND
+
+        prompt=normalize_text_prompt(prompt)
+        if not is_api_job_id(job_id):
+            raise ValueError(f"invalid API job id: {job_id!r}")
+        if isinstance(seed,bool) or not isinstance(seed,int) or not 0 <= seed <= 100000:
+            raise ValueError("seed must be an integer in 0..100000")
+        artifacts.reload()
+        root=api_job_root(job_id)
+        root.mkdir(parents=True,exist_ok=True)
+        full_prompt=PROMPT_APPEND.format(object=prompt)
+        generator=torch.Generator().manual_seed(seed)
+        t0=time.perf_counter()
+        image_out=self.pipe(
+            prompt=full_prompt,
+            height=1024,
+            width=1024,
+            num_inference_steps=25,
+            guidance_scale=7.0,
+            num_images_per_prompt=1,
+            generator=generator,
+        ).images[0]
+        output=root/"input_image"
+        image_out.save(output,format="PNG")
+        (root/"prompt.txt").write_text(prompt+"\n")
+        artifacts.commit()
+        out={
+            "job_id":job_id,
+            "model":"kolors",
+            "model_revision":TEXT2IMG_MODEL_REVISION,
+            "seed":seed,
+            "width":image_out.width,
+            "height":image_out.height,
+            "load_seconds":round(self.load_seconds,3),
+            "generate_seconds":round(time.perf_counter()-t0,3),
+        }
+        print("TEXT2IMG_OK",json.dumps(out),flush=True)
+        return out
 
 
 def _rembg_load(worker, cpu_label: str) -> None:
@@ -1125,20 +1312,31 @@ def _job_update(job_id: str, **changes) -> dict:
     buffer_containers=0,
     scaledown_window=2,
 )
-def run_job(job_id: str, profile: str) -> dict:
-    """Cheap orchestrator; expensive stages remain independently autoscaled."""
+def run_job(job_id: str, profile: str, prompt: str | None=None, text_seed: int=0) -> dict:
+    """Cheap orchestrator; optional Text→Image feeds the same validated Image→3D stages."""
     if not is_api_job_id(job_id):
         raise ValueError(f"invalid API job id: {job_id!r}")
     if profile not in AUTOSCALE_PROFILES:
         raise ValueError(f"unknown autoscale profile: {profile!r}")
     rembg_worker, sam_worker, mesh_worker, lite_worker, finalizer = runtime_handles()
-    stages = (
+    stages=[]
+    if prompt is not None:
+        prompt=normalize_text_prompt(prompt)
+        text_worker=Text2ImageWorker()
+        text_worker.update_autoscaler(
+            min_containers=0,
+            max_containers=1,
+            buffer_containers=0,
+            scaledown_window=TEXT2IMG_SCALEDOWN_WINDOWS[profile],
+        )
+        stages.append(("text2image",lambda: text_worker.generate.remote(job_id,prompt,text_seed)))
+    stages.extend((
         ("rembg", lambda: rembg_worker.prepare.remote(job_id)),
         ("sam3d", lambda: sam_worker.generate.remote(job_id)),
         ("mesh", lambda: mesh_worker.process.remote(job_id)),
         ("texture", lambda: lite_worker.remote(job_id)),
         ("finalize", lambda: finalizer.remote(job_id, True)),
-    )
+    ))
     stage = "dispatch"
     timings = {}
     try:
@@ -1223,7 +1421,7 @@ def job_api():
     from fastapi.responses import FileResponse
     from PIL import Image
 
-    web = FastAPI(title="EmbodiedGen Job API", version="1.0")
+    web = FastAPI(title="EmbodiedGen Job API", version="1.1")
 
     @web.get("/health")
     def health():
@@ -1293,6 +1491,73 @@ def job_api():
             failed["updated_at"]=datetime.fromtimestamp(stamp,timezone.utc).isoformat()
             await job_states.put.aio(job_id,failed)
             raise HTTPException(status_code=503, detail="job dispatch failed") from exc
+        return state
+
+    @web.post("/text-jobs", status_code=202)
+    async def submit_text_job(
+        payload: dict = Body(..., media_type="application/json"),  # noqa: B008
+        profile: str = DEFAULT_REQUEST_PROFILE,
+    ):
+        if profile != "auto" and profile not in AUTOSCALE_PROFILES:
+            raise HTTPException(status_code=400, detail="unknown autoscale profile")
+        try:
+            prompt=normalize_text_prompt(payload.get("prompt"))
+        except (TypeError,ValueError) as exc:
+            raise HTTPException(status_code=422,detail=str(exc)) from exc
+        seed=payload.get("seed",0)
+        if isinstance(seed,bool) or not isinstance(seed,int) or not 0 <= seed <= 100000:
+            raise HTTPException(status_code=422,detail="seed must be an integer in 0..100000")
+
+        job_id=new_job_id()
+        root=api_job_root(job_id)
+        root.mkdir(parents=True,exist_ok=False)
+        (root/"prompt.txt").write_text(prompt+"\n")
+        await artifacts.commit.aio()
+
+        try:
+            profile_info=await select_request_profile_aio(profile)
+            await apply_autoscale_profile_aio(profile_info["selected_profile"])
+        except Exception as exc:
+            import shutil
+
+            shutil.rmtree(root,ignore_errors=True)
+            await artifacts.commit.aio()
+            raise HTTPException(status_code=503,detail="autoscale setup failed") from exc
+
+        now=time.time()
+        state={
+            "job_id":job_id,
+            "status":"queued",
+            "stage":"queued",
+            "profile":profile_info["selected_profile"],
+            "requested_profile":profile,
+            "created_epoch":now,
+            "created_at":datetime.fromtimestamp(now,timezone.utc).isoformat(),
+            "updated_epoch":now,
+            "updated_at":datetime.fromtimestamp(now,timezone.utc).isoformat(),
+            "input":{
+                "type":"text",
+                "prompt_chars":len(prompt),
+                "backend":"kolors",
+                "seed":seed,
+            },
+        }
+        await job_states.put.aio(job_id,state)
+        try:
+            await run_job.spawn.aio(job_id,profile_info["selected_profile"],prompt,seed)
+        except Exception as exc:
+            failed=dict(state)
+            failed.update(
+                status="failed",
+                stage="dispatch",
+                error_type=type(exc).__name__,
+                error=str(exc)[:2000],
+            )
+            stamp=time.time()
+            failed["updated_epoch"]=stamp
+            failed["updated_at"]=datetime.fromtimestamp(stamp,timezone.utc).isoformat()
+            await job_states.put.aio(job_id,failed)
+            raise HTTPException(status_code=503,detail="job dispatch failed") from exc
         return state
 
     @web.get("/jobs/{job_id}")

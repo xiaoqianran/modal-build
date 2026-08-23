@@ -17,6 +17,15 @@ class RuntimePinsTest(unittest.TestCase):
         for value in (runtime.EMBODIEDGEN_COMMIT, runtime.CLIP_COMMIT, runtime.KOLORS_COMMIT):
             self.assertRegex(value, r"^[0-9a-f]{40}$")
 
+    def test_text2img_snapshot_is_exactly_pinned(self):
+        self.assertEqual(runtime.TEXT2IMG_MODEL_ID, "Kwai-Kolors/Kolors-diffusers")
+        self.assertRegex(runtime.TEXT2IMG_MODEL_REVISION, r"^[0-9a-f]{40}$")
+        source = RUNTIME.read_text()
+        self.assertIn("revision=TEXT2IMG_MODEL_REVISION", source)
+        self.assertIn("TEXT2IMG_REVISION_MARKER", source)
+        self.assertIn("current_revision != TEXT2IMG_MODEL_REVISION", source)
+        self.assertIn("local_files_only=True", source)
+
     def test_release_hashes_are_sha256(self):
         self.assertEqual(
             runtime.RELEASE_WHEELS_SHA256,

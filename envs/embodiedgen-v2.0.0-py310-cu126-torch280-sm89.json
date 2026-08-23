@@ -46,5 +46,13 @@
     "tag": "embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1",
     "wheels_sha256": "4168abccbc9a0033825e3ad8b9a9e992795f6449107adf357a4dd4acafec398c",
     "torch_extensions_sha256": "e5e1991ec465b399d46bca271af46394b054afd9eefdbcdcd8b5329f4c8e5bb3"
+  },
+  "text_to_3d": {
+    "backend": "kolors-to-sam3d",
+    "text_to_image_model": "Kwai-Kolors/Kolors-diffusers",
+    "text_to_image_revision": "7e091c75199e910a26cd1b51ed52c28de5db3711",
+    "weights_location": "Modal Volume /weights/text2img/kolors-diffusers",
+    "gpu": "L40S",
+    "offline_gpu_load": true
   }
 }
