@@ -1,0 +1,36 @@
+{
+  "name": "embodiedgen-v2.0.0",
+  "source": "HorizonRobotics/EmbodiedGen",
+  "tag": "v2.0.0",
+  "python": "3.10",
+  "ubuntu": "22.04",
+  "cuda": "12.6.3",
+  "pytorch": "2.8.0",
+  "torchvision": "0.23.0",
+  "xformers": "0.0.32.post2",
+  "gsplat": "1.5.3",
+  "kaolin": "0.18.0",
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "artifacts": [
+    "pytorch3d@75ebeeaea0908c5527e7b1e305fbc7681382db47",
+    "nvdiffrast@729261d",
+    "gsplat-1.5.3 O3 torch-extension cache for SM89"
+  ],
+  "runtime_notes": {
+    "sam3d_weights": "kept outside release assets in Modal Volume",
+    "hf_zerogpu_decorators": "disabled for real Modal GPU workers",
+    "headless_postprocess": "isolated CUDA subprocesses",
+    "validation_profile": "24-view horizontal fast texture bake, 60-frame preview, no delight, no mesh-fix, no aesthetic model"
+  },
+  "validated": {
+    "command": "img3d-cli --image_path apps/assets/example_image/sample_00.jpg --output_root /data/outputs/test",
+    "gpu": "NVIDIA L40S",
+    "ply_vertices": 95004,
+    "obj_vertices": 516271,
+    "obj_faces": 891420,
+    "glb_geometries": 1,
+    "video_duration_seconds": 2.0,
+    "result": "VALIDATION_OK"
+  }
+}

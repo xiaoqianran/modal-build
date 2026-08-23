@@ -1,0 +1,149 @@
+diff --git a/embodied_gen/data/backproject_v3.py b/embodied_gen/data/backproject_v3.py
+index 2c053c3..7bbb613 100644
+--- a/embodied_gen/data/backproject_v3.py
++++ b/embodied_gen/data/backproject_v3.py
+@@ -14,6 +14,8 @@
+ # implied. See the License for the specific language governing
+ # permissions and limitations under the License.
+ 
++from __future__ import annotations
++
+ import argparse
+ import logging
+ import math
+@@ -25,12 +27,12 @@ import numpy as np
+ import nvdiffrast.torch as dr
+ import spaces
+ import torch
++from gsplat import rasterization
+ import trimesh
+ import utils3d
+ import xatlas
+ from PIL import Image
+ from tqdm import tqdm
+-from embodied_gen.data.mesh_operator import MeshFixer
+ from embodied_gen.data.utils import (
+     CameraSetting,
+     init_kal_camera,
+@@ -39,9 +41,7 @@ from embodied_gen.data.utils import (
+     post_process_texture,
+     save_mesh_with_mtl,
+ )
+-from embodied_gen.models.delight_model import DelightingModel
+ from embodied_gen.models.gs_model import load_gs_model
+-from embodied_gen.models.sr_model import ImageRealESRGAN
+ 
+ logging.basicConfig(
+     format="%(asctime)s - %(levelname)s - %(message)s", level=logging.INFO
+@@ -466,16 +466,34 @@ def entrypoint(
+     gs_model = load_gs_model(args.gs_path, pre_quat=[0.0, 0.0, 1.0, 0.0])
+     multiviews = []
+     for idx in tqdm(range(len(c2ws)), desc="Rendering GS"):
+-        result = gs_model.render(
+-            c2ws[idx],
+-            Ks=Ks,
+-            image_width=camera_params.resolution_hw[1],
+-            image_height=camera_params.resolution_hw[0],
++        c2w = c2ws[idx]
++        gs = gs_model.get_gaussians(c2w, apply_activate=True)
++        renders, alphas, _ = rasterization(
++            means=gs._means,
++            quats=gs._quats,
++            scales=gs._scales,
++            opacities=gs._opacities.squeeze(),
++            colors=gs._rgbs,
++            viewmats=torch.linalg.inv(c2w)[None, ...],
++            Ks=Ks[None, ...],
++            width=camera_params.resolution_hw[1],
++            height=camera_params.resolution_hw[0],
++            packed=False,
++            absgrad=True,
++            sparse_grad=False,
++            rasterize_mode="antialiased",
++            near_plane=0.01,
++            far_plane=1000000000,
++            radius_clip=0.0,
++            render_mode="RGB+ED",
+         )
+-        color = cv2.cvtColor(result.rgba, cv2.COLOR_BGRA2RGBA)
+-        multiviews.append(Image.fromarray(color))
++        torch.cuda.synchronize()
++        rgb = (renders[0, ..., :3].clamp(0, 1) * 255).to(torch.uint8).cpu().numpy()
++        multiviews.append(Image.fromarray(rgb, mode="RGB"))
+ 
+     if args.delight and delight_model is None:
++        # Heavy diffusion stack is loaded only when delight is actually requested.
++        from embodied_gen.models.delight_model import DelightingModel
+         delight_model = DelightingModel()
+ 
+     if args.delight:
+@@ -501,6 +519,8 @@ def entrypoint(
+     vertices = vertices.astype(np.float32)
+ 
+     if not args.skip_fix_mesh:
++        # Open3D/mesh-repair stack is expensive to import; keep it off smoke path.
++        from embodied_gen.data.mesh_operator import MeshFixer
+         mesh_fixer = MeshFixer(vertices, faces, args.device)
+         vertices, faces = mesh_fixer(
+             filter_ratio=args.mesh_sipmlify_ratio,
+diff --git a/embodied_gen/models/gs_model.py b/embodied_gen/models/gs_model.py
+index 003abd3..1b21725 100644
+--- a/embodied_gen/models/gs_model.py
++++ b/embodied_gen/models/gs_model.py
+@@ -485,6 +485,11 @@ class GaussianOperator(GaussianBase):
+                 "render_mode": "RGB+ED",
+             },
+         )
++        # torch 2.8 + gsplat 1.5.x on headless CUDA can stall when the first
++        # implicit device->host sync happens inside RenderResult.  An explicit
++        # stream synchronization immediately after rasterization is deterministic
++        # and preserves the exact upstream rendering math.
++        torch.cuda.synchronize()
+         renders = renders[0]
+         alphas = alphas[0].squeeze(-1)
+ 
+diff --git a/embodied_gen/scripts/imageto3d.py b/embodied_gen/scripts/imageto3d.py
+index 6de3be5..a5a7103 100644
+--- a/embodied_gen/scripts/imageto3d.py
++++ b/embodied_gen/scripts/imageto3d.py
+@@ -272,6 +272,40 @@ def entrypoint(**kwargs):
+                     instance_pose=pose,
+                     device="cpu",
+                 )
++                # Modal two-process mode: persist the in-memory SAM3D outputs and
++                # terminate this CUDA process before any rendering/backprojection. A fresh
++                # process on the same L40S will reload this compact state and post-process.
++                if os.environ.get("MODAL_GENERATE_ONLY") == "1":
++                    import pickle
++                    from embodied_gen.utils.trender import pack_state
++
++                    state_path = os.path.join(output_root, f"{filename}_state.pkl")
++                    state = pack_state(gs_model, mesh_model)
++                    with open(state_path, "wb") as f:
++                        pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
++                    logger.info(f"Saved SAM3D state for clean postprocess: {state_path}")
++                    logger.info("MODAL_GENERATE_ONLY complete; exiting CUDA process.")
++                    return
++                # Modal/L40S headless: with n_retry=1 SAM3D is no longer needed
++                # after GS+mesh are produced. Free the large pipeline before rendering.
++                if args.image3d_model == "SAM3D" and args.n_retry == 1:
++                    import gc
++                    import torch
++                    before_gib = torch.cuda.memory_allocated() / (1024 ** 3)
++                    _PIPELINE_CACHE.pop("SAM3D", None)
++                    try:
++                        pipeline.pipeline = None
++                    except Exception:
++                        pass
++                    outputs = None
++                    gc.collect()
++                    torch.cuda.empty_cache()
++                    torch.cuda.synchronize()
++                    after_gib = torch.cuda.memory_allocated() / (1024 ** 3)
++                    logger.info(
++                        f"Released SAM3D pipeline VRAM: {before_gib:.2f} -> {after_gib:.2f} GiB"
++                    )
++
+                 color_path = os.path.join(output_root, "color.png")
+                 render_gs_api(
+                     input_gs=aligned_gs_path,
