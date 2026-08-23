@@ -132,7 +132,9 @@ Lite L40S bake
     ↓
 CPU finalize
   - OBJ / GLB / fallback URDF
-  - structural validation
+  - self-contained OBJ material bundle validation
+  - video / geometry / material structural validation
+  - default scaledown_window=2s (`cost_first`)
 ```
 
 This avoids holding an L40S while xatlas unwraps a large mesh. The current production default is the
@@ -480,7 +482,7 @@ A clean CPU-only Dict-to-MeshWorker run measured:
 | Dict get | **0.597 s** |
 | persist `state.pkl` + deserialize | 0.041 s |
 | rebuild raw + aligned PLY | 0.056 s |
-| fast-simplification to 50k | 0.437 s |
+| fast-simplification to 50k | **invalid in this historical log** |
 | xatlas | 5.501 s |
 | Dict delete | 0.437 s |
 | MeshWorker method total | **8.651 s** |
@@ -488,6 +490,13 @@ A clean CPU-only Dict-to-MeshWorker run measured:
 The CPU worker also has a `volume-fallback` retry path. If a retry occurs after state was already
 persisted but after the transient Dict item was removed, it reuses `sample_00_state.pkl` rather than
 forcing another paid SAM3D run.
+
+The historical `fast-simplification` row above was discovered during the 2026-08-23 local audit to
+have a timing-variable bug: the simplify timer names were reused later for `Dict.pop()`, so the logged
+0.437 s simplify value was actually the Dict-delete duration. Geometry and method/xatlas results were
+not affected. After fixing the timers, a CPU-only real-state rerun (891,852 input faces -> 50,000)
+measured **1.326 s simplify**, **4.343 s xatlas**, **0.075 s Dict delete**, and **7.008 s total
+MeshWorker method**. These corrected measurements are now emitted from independent timer variables.
 
 The resulting CPU-generated aligned PLY then completed the real Lite L40S stage in **4.215 s**
 (function time; 24-view render 0.184 s, texture bake 1.200 s), followed by CPU finalization in
@@ -521,12 +530,12 @@ capacity eventually reaches zero and no second GPU container is created accident
 
 Current profiles:
 
-| Profile | Rembg CPU | Heavy L40S | Mesh CPU | Lite L40S | Maximum idle-tail cost / isolated burst |
-|---|---:|---:|---:|---:|---:|
-| `min_cost` | 2 s | 2 s | 2 s | 2 s | **$0.00283** |
-| `cost_first` (static fallback) | 60 s | 30 s | 30 s | 10 s | **$0.03048** |
-| `balanced` | 120 s | 90 s | 90 s | 30 s | $0.09011 |
-| `burst` | 300 s | 180 s | 120 s | 60 s | $0.17733 |
+| Profile | Rembg CPU | Heavy L40S | Mesh CPU | Lite L40S | Finalize CPU | Maximum idle-tail cost / isolated burst |
+|---|---:|---:|---:|---:|---:|---:|
+| `min_cost` | 2 s | 2 s | 2 s | 2 s | 2 s | **$0.00300** |
+| `cost_first` (static fallback) | 60 s | 30 s | 30 s | 10 s | 2 s | **$0.03065** |
+| `balanced` | 120 s | 90 s | 90 s | 30 s | 10 s | $0.09099 |
+| `burst` | 300 s | 180 s | 120 s | 60 s | 30 s | $0.17997 |
 
 These costs include the full allocated resource set, not only the GPU line item. At the current
 2026-08-23 workspace rates used by the runtime calculator:
@@ -535,12 +544,12 @@ These costs include the full allocated resource set, not only the GPU line item.
 - memory: $0.00800 / GiB-hour;
 - L40S: $1.95 / GPU-hour.
 
-Thus the allocated hourly rates of the four warm containers are approximately $0.0793/h for Rembg,
-$2.4898/h for Heavy SAM3D (L40S + 6 CPU + 32 GiB), $0.2532/h for MeshWorker, and $2.2672/h for Lite
-L40S (L40S + 4 CPU + 16 GiB).
+Thus the allocated hourly rates of the five warm containers are approximately $0.0793/h for Rembg,
+$2.4898/h for Heavy SAM3D (L40S + 6 CPU + 32 GiB), $0.2532/h for MeshWorker, $2.2672/h for Lite L40S
+(L40S + 4 CPU + 16 GiB), and $0.3172/h for CPU finalize (4 CPU + 16 GiB).
 
-`cost_first` cuts the theoretical isolated-burst idle tail from $0.09011 to $0.03048, a reduction of
-about **66.2%** versus the former `balanced` policy. `min_cost` cuts it to about $0.00283, but usually
+`cost_first` cuts the theoretical isolated-burst idle tail from $0.09099 to $0.03065, a reduction of
+about **66.3%** versus the `balanced` policy. `min_cost` cuts it to about $0.00300, but usually
 forces a cold start on the next non-overlapping request and is intended for extremely sparse traffic.
 The Heavy SAM3D cold model-load penalty has measured roughly 36-48 seconds, so keeping its $2.4898/h
 container warm for 30 seconds costs about $0.02075. In a genuinely sparse workload, `min_cost` wins;
@@ -567,8 +576,8 @@ Zero-GPU control-plane validation on 2026-08-23:
 
 ```text
 traffic state cleared
-AUTO request #1 -> min_cost   (1 request / 60s, idle-tail ceiling $0.00282750)
-AUTO request #2 -> cost_first (2 requests / 60s, idle-tail ceiling $0.03047778)
+AUTO request #1 -> min_cost   (1 request / 60s, idle-tail ceiling $0.00300372)
+AUTO request #2 -> cost_first (2 requests / 60s, idle-tail ceiling $0.03065400)
 ```
 
 The test only hydrated the Modal app and updated autoscaler settings; it did not invoke any model
@@ -593,3 +602,53 @@ that ephemeral app after the check. Production orchestration must call `select_r
 `apply_autoscale_profile()` in the same app run before dispatching the workers, as `benchmark_split`
 already does. AUTO deliberately caps itself at `cost_first`: the 90/180-second GPU tails buy latency,
 but are not the economical default when the primary requirement is minimum spend.
+
+## 2026-08-23 local audit fixes
+
+A full local/static audit found and fixed four production correctness issues without using Heavy L40S:
+
+- OBJ result packaging previously copied `sample_00.obj` but omitted Trimesh-generated
+  `material.mtl` and `material_0.png`. `copy_obj_bundle()` now follows the OBJ -> MTL -> texture
+  references, rejects references that escape the job directory, preserves relative subpaths, and
+  fails if a referenced asset is missing.
+- Mesh simplification now runs only when the input has more than 50,000 faces. Smaller valid meshes
+  bypass `fast-simplification`, which otherwise raises when `target_count >= current face count`.
+- Mesh simplify and transient-state-delete timers now use independent variables; the historical
+  simplify timing error is documented above.
+- `VALIDATION_OK` now requires the preview video and a complete OBJ material dependency chain in
+  addition to PLY/OBJ/GLB/URDF geometry checks.
+
+The CPU finalizer is also now part of every autoscale profile (`min_containers=0`,
+`buffer_containers=0`, `max_containers=1`). `cost_first` gives it only a 2-second idle tail, closing a
+previous cost-accounting gap where its 4 CPU + 16 GiB container was not represented in the profile
+calculator.
+
+Real Artifact verification after the fixes, using `bench-20260823T121021-warm`, returned:
+
+```text
+VALIDATION_OK
+ply_vertices             95560
+obj_vertices             32517
+obj_faces                50000
+glb_geometries           1
+urdf_mesh_exists         true
+video_exists             true
+obj_material_missing     []
+obj_material_refs_ok     true
+```
+
+The delivered `result/mesh/` now contains the complete OBJ chain:
+
+```text
+sample_00.obj
+  -> material.mtl
+       -> material_0.png
+sample_00.glb
+sample_00_gs.ply
+sample_00_gs_aligned.ply
+texture.png
+```
+
+Seventeen local unit tests cover autoscale policy plus the new small-mesh bypass, OBJ material bundle,
+path-escape rejection, missing-texture detection, and validation negative cases. The real MeshWorker
+and finalizer regression runs were CPU-only; no L40S was allocated for these fixes.

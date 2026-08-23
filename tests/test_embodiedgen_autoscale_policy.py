@@ -32,14 +32,15 @@ class AutoscalePolicyTest(unittest.TestCase):
         self.assertEqual(count, 20)
 
     def test_every_profile_defines_every_stage(self):
-        expected = {"rembg", "sam3d", "mesh", "lite"}
+        expected = {"rembg", "sam3d", "mesh", "lite", "finalize"}
         for profile in runtime.AUTOSCALE_PROFILES.values():
             self.assertEqual(set(profile), expected)
 
     def test_cost_first_tail_cost_is_stable(self):
         summary = runtime.autoscale_profile_summary("cost_first")
-        self.assertAlmostEqual(summary["idle_tail_total_usd"], 0.03047778, places=8)
+        self.assertAlmostEqual(summary["idle_tail_total_usd"], 0.03065400, places=8)
         self.assertEqual(summary["scaledown_window_seconds"]["sam3d"], 30)
+        self.assertEqual(summary["scaledown_window_seconds"]["finalize"], 2)
 
     def test_unknown_profile_fails_closed(self):
         with self.assertRaises(ValueError):

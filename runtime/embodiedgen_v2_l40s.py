@@ -19,14 +19,15 @@ RELEASE = f"https://github.com/xiaoqianran/modal-build/releases/download/{TAG}"
 APP_NAME = "modal-3d-embodiedgen"
 SAM3D_STAGE1_STEPS = 16
 SAM3D_STAGE2_STEPS = 16
+TARGET_MESH_FACES = 50_000
 
 STATIC_AUTOSCALE_PROFILE = "cost_first"
 DEFAULT_REQUEST_PROFILE = "auto"
 AUTOSCALE_PROFILES = {
-    "min_cost": {"rembg": 2, "sam3d": 2, "mesh": 2, "lite": 2},
-    "cost_first": {"rembg": 60, "sam3d": 30, "mesh": 30, "lite": 10},
-    "balanced": {"rembg": 120, "sam3d": 90, "mesh": 90, "lite": 30},
-    "burst": {"rembg": 300, "sam3d": 180, "mesh": 120, "lite": 60},
+    "min_cost": {"rembg": 2, "sam3d": 2, "mesh": 2, "lite": 2, "finalize": 2},
+    "cost_first": {"rembg": 60, "sam3d": 30, "mesh": 30, "lite": 10, "finalize": 2},
+    "balanced": {"rembg": 120, "sam3d": 90, "mesh": 90, "lite": 30, "finalize": 10},
+    "burst": {"rembg": 300, "sam3d": 180, "mesh": 120, "lite": 60, "finalize": 30},
 }
 AUTO_TRAFFIC_WINDOW_SECONDS = 60.0
 AUTO_COST_FIRST_REQUESTS = 2
@@ -41,6 +42,7 @@ RESOURCE_HOURLY_COST = {
     "sam3d": RATE_L40S_HOUR + 6 * RATE_CPU_CORE_HOUR + 32 * RATE_MEMORY_GIB_HOUR,
     "mesh": 4 * RATE_CPU_CORE_HOUR + 8 * RATE_MEMORY_GIB_HOUR,
     "lite": RATE_L40S_HOUR + 4 * RATE_CPU_CORE_HOUR + 16 * RATE_MEMORY_GIB_HOUR,
+    "finalize": 4 * RATE_CPU_CORE_HOUR + 16 * RATE_MEMORY_GIB_HOUR,
 }
 
 
@@ -109,9 +111,89 @@ def select_request_profile(requested: str = DEFAULT_REQUEST_PROFILE, now: float 
     }
 
 
+def simplify_mesh_if_needed(vertices, faces, simplify_fn, target_faces: int = TARGET_MESH_FACES):
+    """Simplify only oversized meshes; small meshes pass through unchanged."""
+    if len(faces) <= target_faces:
+        return vertices, faces, False
+    vertices, faces = simplify_fn(
+        vertices,
+        faces,
+        target_count=target_faces,
+        agg=7.0,
+        preserve_border=False,
+    )
+    return vertices, faces, True
+
+
+def obj_material_dependencies(obj_path: Path) -> list[Path]:
+    """Return generated MTL/texture files referenced by an OBJ, without leaving its directory."""
+    import shlex
+
+    root = obj_path.parent.resolve()
+    dependencies = []
+    material_files = []
+    for raw_line in obj_path.read_text(errors="ignore").splitlines():
+        tokens = shlex.split(raw_line, comments=True)
+        if tokens and tokens[0].lower() == "mtllib":
+            material_files.extend(tokens[1:])
+
+    def add_relative(reference: str, base: Path = root):
+        candidate = (base / reference).resolve()
+        if candidate != root and root not in candidate.parents:
+            raise RuntimeError(f"OBJ material reference escapes job directory: {reference}")
+        if candidate not in dependencies:
+            dependencies.append(candidate)
+
+    for material in material_files:
+        add_relative(material)
+        mtl_path = (root / material).resolve()
+        if not mtl_path.exists():
+            continue
+        for raw_line in mtl_path.read_text(errors="ignore").splitlines():
+            tokens = shlex.split(raw_line, comments=True)
+            if not tokens:
+                continue
+            directive = tokens[0].lower()
+            if (
+                directive.startswith("map_") or directive in {"bump", "disp", "decal", "norm"}
+            ) and len(tokens) > 1:
+                # Trimesh emits simple references; the final token also handles common MTL options.
+                add_relative(tokens[-1], mtl_path.parent)
+    return dependencies
+
+
+def copy_obj_bundle(obj_path: Path, destination: Path) -> None:
+    """Copy OBJ plus every referenced MTL/texture asset as a self-contained bundle."""
+    import shutil
+
+    destination.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(obj_path, destination / obj_path.name)
+    source_root = obj_path.parent.resolve()
+    for dependency in obj_material_dependencies(obj_path):
+        if not dependency.exists():
+            raise FileNotFoundError(f"missing OBJ dependency: {dependency}")
+        relative = dependency.relative_to(source_root)
+        target = destination / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(dependency, target)
+
+
+def missing_obj_material_dependencies(obj_path: Path) -> list[str]:
+    root = obj_path.parent.resolve()
+    return [str(path.relative_to(root)) for path in obj_material_dependencies(obj_path) if not path.exists()]
+
+
+def validation_passes(checks: dict) -> bool:
+    required_positive = ("ply_vertices", "obj_vertices", "obj_faces", "glb_geometries")
+    return all(checks[name] > 0 for name in required_positive) and all(
+        checks[name]
+        for name in ("urdf_mesh_exists", "video_exists", "obj_material_refs_ok")
+    )
+
+
 def runtime_handles():
     """Return the single shared pool handles used by every autoscale profile."""
-    return RembgWorker(), Sam3DWorker(), MeshWorker(), lite_gpu_bake
+    return RembgWorker(), Sam3DWorker(), MeshWorker(), lite_gpu_bake, cpu_finalize
 
 
 def apply_autoscale_profile(profile: str, handles=None) -> tuple:
@@ -119,17 +201,18 @@ def apply_autoscale_profile(profile: str, handles=None) -> tuple:
     cfg = AUTOSCALE_PROFILES.get(profile)
     if cfg is None:
         raise ValueError(f"unknown autoscale profile {profile!r}; choose {sorted(AUTOSCALE_PROFILES)}")
-    rembg_worker, sam_worker, mesh_worker, lite_worker = handles or runtime_handles()
+    rembg_worker, sam_worker, mesh_worker, lite_worker, finalizer = handles or runtime_handles()
     common = {"min_containers": 0, "max_containers": 1, "buffer_containers": 0}
     autoscalers = {
         "rembg": rembg_worker,
         "sam3d": sam_worker,
         "mesh": mesh_worker,
         "lite": lite_worker,
+        "finalize": finalizer,
     }
     for stage, target in autoscalers.items():
         target.update_autoscaler(scaledown_window=cfg[stage], **common)
-    return rembg_worker, sam_worker, mesh_worker, lite_worker
+    return rembg_worker, sam_worker, mesh_worker, lite_worker, finalizer
 
 app = modal.App(APP_NAME)
 weights = modal.Volume.from_name("modal-3d-embodiedgen-weights", create_if_missing=True)
@@ -614,23 +697,25 @@ class MeshWorker:
         rot_matrix=np.array([[0,0,-1],[0,1,0],[1,0,0]],dtype=np.float32)
         vertices=vertices @ mesh_add_rot @ rot_matrix
 
-        # Critical path deliberately does not export the 884k-face raw OBJ.
-        # state.pkl remains the lossless high-poly intermediate if it is needed later.
-        d0=time.perf_counter()
-        vertices,faces=fast_simplification.simplify(
+        # Critical path deliberately does not export the high-poly raw OBJ.
+        # Small meshes must bypass simplification: fast-simplification rejects
+        # target_count >= current face count.
+        simplify0=time.perf_counter()
+        vertices,faces,was_simplified=simplify_mesh_if_needed(
             vertices,
             faces,
-            target_count=50000,
-            agg=7.0,
-            preserve_border=False,
+            fast_simplification.simplify,
         )
-        d1=time.perf_counter()
+        simplify1=time.perf_counter()
         vertices=np.asarray(vertices,dtype=np.float32)
         faces=np.asarray(faces,dtype=np.int32)
 
         bbmin=vertices.min(0); bbmax=vertices.max(0)
+        extent=float((bbmax-bbmin).max())
+        if not np.isfinite(extent) or extent <= 0.0:
+            raise RuntimeError(f"invalid mesh extent for {job_id}: {extent}")
         center=(bbmin+bbmax)*0.5
-        scale=np.float32(2.0/(bbmax-bbmin).max())
+        scale=np.float32(2.0/extent)
         norm=(vertices-center)*scale
         x_rot=np.array([[1,0,0],[0,0,1],[0,-1,0]],dtype=np.float32)
         z_rot=np.array([[0,1,0],[-1,0,0],[0,0,1]],dtype=np.float32)
@@ -653,7 +738,7 @@ class MeshWorker:
             z_rot=z_rot,
         )
         artifacts.commit()
-        d0=time.perf_counter(); state_handoff.pop(job_id,None); d1=time.perf_counter()
+        delete0=time.perf_counter(); state_handoff.pop(job_id,None); delete1=time.perf_counter()
         result={
             "job_id":job_id,
             "instance_id":self.instance_id,
@@ -661,13 +746,14 @@ class MeshWorker:
             "state_handoff_source":handoff_source,
             "state_handoff_get_seconds":round(float(g1-g0),3),
             "state_persist_and_load_seconds":round(float(persist1-persist0),3),
-            "state_handoff_delete_seconds":round(float(d1-d0),3),
+            "state_handoff_delete_seconds":round(float(delete1-delete0),3),
             "ply_rebuild_seconds":round(pg1-pg0,3),
             "input_vertices":int(input_vertices),
             "input_faces":int(input_faces),
             "dec_vertices":len(vertices),
             "dec_faces":len(faces),
-            "simplify_seconds":round(d1-d0,3),
+            "was_simplified":was_simplified,
+            "simplify_seconds":round(simplify1-simplify0,3),
             "uv_vertices":len(baked_vertices),
             "uv_faces":len(indices),
             "xatlas_seconds":round(x1-x0,3),
@@ -766,6 +852,10 @@ def lite_gpu_bake(job_id: str) -> dict:
     timeout=15 * 60,
     cpu=4.0,
     memory=16384,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=AUTOSCALE_PROFILES[STATIC_AUTOSCALE_PROFILE]["finalize"],
 )
 def cpu_finalize(job_id: str) -> dict:
     """Pure CPU: restore mesh scale, export OBJ/GLB, write fallback URDF and validate."""
@@ -795,10 +885,10 @@ def cpu_finalize(job_id: str) -> dict:
     result=root/"result"; meshdir=result/"mesh"
     if result.exists(): shutil.rmtree(result)
     meshdir.mkdir(parents=True,exist_ok=True)
+    copy_obj_bundle(obj,meshdir)
     for pth in root.glob("sample_00*.*"):
-        if pth.suffix.lower() in {".obj",".mtl",".glb",".ply"}: shutil.copy2(pth,meshdir/pth.name)
-    for pth in root.glob("*.png"):
-        if pth.name=="texture.png": shutil.copy2(pth,meshdir/pth.name)
+        if pth.suffix.lower() in {".glb",".ply"}: shutil.copy2(pth,meshdir/pth.name)
+    if (root/"texture.png").exists(): shutil.copy2(root/"texture.png",meshdir/"texture.png")
     if (root/"preview.mp4").exists(): shutil.copy2(root/"preview.mp4",result/"video.mp4")
 
     # GPT-free fallback attributes match the upstream fallback semantics.
@@ -814,7 +904,8 @@ def cpu_finalize(job_id: str) -> dict:
     urdf=result/"sample_00.urdf"; ET.ElementTree(robot).write(urdf,encoding="utf-8",xml_declaration=True)
 
     # Structural validation.
-    objm=trimesh.load(obj,force="mesh"); glbs=trimesh.load(glb,force="scene")
+    result_obj=meshdir/"sample_00.obj"; result_glb=meshdir/"sample_00.glb"
+    objm=trimesh.load(result_obj,force="mesh"); glbs=trimesh.load(result_glb,force="scene")
     ET.parse(urdf)
     with (root/"sample_00_gs.ply").open("rb") as f: header=f.read(8192).decode("ascii","ignore")
     ply_vertices=next(int(x.split()[-1]) for x in header.splitlines() if x.startswith("element vertex "))
@@ -823,10 +914,12 @@ def cpu_finalize(job_id: str) -> dict:
         "obj_vertices":len(objm.vertices),
         "obj_faces":len(objm.faces),
         "glb_geometries":len(glbs.geometry),
-        "urdf_mesh_exists":(result/"mesh/sample_00.obj").exists(),
+        "urdf_mesh_exists":result_obj.exists(),
         "video_exists":(result/"video.mp4").exists(),
+        "obj_material_missing":missing_obj_material_dependencies(result_obj),
     }
-    if not all([checks["ply_vertices"]>0,checks["obj_vertices"]>0,checks["obj_faces"]>0,checks["glb_geometries"]>0,checks["urdf_mesh_exists"]]):
+    checks["obj_material_refs_ok"]=not checks["obj_material_missing"]
+    if not validation_passes(checks):
         raise RuntimeError(checks)
     report={"job_id":job_id,"checks":checks,"seconds":round(time.perf_counter()-t0,3)}
     (root/"validation_report.json").write_text(_json.dumps(report,indent=2)+"\n")
@@ -851,7 +944,7 @@ def benchmark_split(profile: str = DEFAULT_REQUEST_PROFILE):
     print("AUTOSCALE_PROFILE",json.dumps(profile_info,ensure_ascii=False,indent=2),flush=True)
     print("WEIGHTS", preload_weights.remote(), flush=True)
     handles=runtime_handles()
-    rembg_worker, worker, mesh_worker, lite_worker=apply_autoscale_profile(
+    rembg_worker, worker, mesh_worker, lite_worker, finalizer=apply_autoscale_profile(
         profile_info["selected_profile"], handles
     )
 
@@ -891,7 +984,7 @@ def benchmark_split(profile: str = DEFAULT_REQUEST_PROFILE):
         down0=time.perf_counter()
         x0=time.perf_counter(); xr=mesh_worker.process.remote(item["job_id"]); xwall=time.perf_counter()-x0
         b0=time.perf_counter(); br=lite_worker.remote(item["job_id"]); bwall=time.perf_counter()-b0
-        f0=time.perf_counter(); fr=cpu_finalize.remote(item["job_id"]); fwall=time.perf_counter()-f0
+        f0=time.perf_counter(); fr=finalizer.remote(item["job_id"]); fwall=time.perf_counter()-f0
         item.update({
             "xatlas":xr,"xatlas_client_wall":round(xwall,3),
             "lite_gpu":br,"lite_gpu_client_wall":round(bwall,3),
