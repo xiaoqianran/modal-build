@@ -100,3 +100,107 @@ Note: the current validated architecture intentionally runs SAM3D generation in 
 post-processing in fresh CUDA subprocesses for stability. Therefore a warm container saves container
 startup/import overhead, but it does **not** keep the 13 GB SAM3D pipeline resident between requests.
 A future persistent-model worker can reduce warm latency further.
+
+## Production split runtime
+
+The current Modal workspace uses profile `shuhuaqaq` and the following persistent storage:
+
+- `modal-3d-embodiedgen-weights` mounted at `/weights` for SAM3D, DINOv2 and U2Net.
+- `modal-3d-artifacts` mounted at `/artifacts` for per-job intermediates and final outputs.
+
+The production path is intentionally split by resource type:
+
+```text
+CPU prepare (rembg)
+    ↓
+Sam3DWorker @app.cls, L40S
+  - SAM3D model loaded once in @modal.enter
+  - min_containers=0
+  - max_containers=1
+  - scaledown_window=90s
+    ↓
+CPU xatlas
+  - mesh orientation / normalization
+  - xatlas UV unwrap
+  - no GPU allocated
+    ↓
+Lite L40S bake
+  - gsplat multiview render
+  - nvdiffrast/utils3d texture baking
+  - no SAM3D weights loaded
+  - scaledown_window=30s
+    ↓
+CPU finalize
+  - OBJ / GLB / fallback URDF
+  - structural validation
+```
+
+This avoids holding an L40S while xatlas unwraps a large mesh. The heavy SAM3D worker remains warm
+for 90 seconds after a request, so bursty requests can reuse the already-loaded 13 GB model without
+forcing a permanent `min_containers=1` GPU. The later texture-bake GPU worker is deliberately light:
+it only loads the precompiled gsplat/nvdiffrast extensions and job artifacts.
+
+Run the CPU-only weight pull in a fresh workspace:
+
+```bash
+modal run runtime/embodiedgen_v2_l40s.py::preload_weights
+```
+
+Run the split cold/warm benchmark:
+
+```bash
+modal run runtime/embodiedgen_v2_l40s.py
+```
+
+The benchmark executes two jobs through the same `Sam3DWorker` class handle. The first call measures
+cold dispatch plus model loading; the second is issued within the 90-second keep-warm window and is
+expected to reuse the resident model container.
+
+## Measured split-runtime performance
+
+Measured on the fresh Modal workspace `shuhuaqaq` with the sample image and the release-only
+(no-`nvcc`) runtime. These are observed values, not estimates.
+
+| Stage | Measured time | Resource |
+|---|---:|---|
+| First CPU rembg request | 46.242 s function / 52.314 s client wall | CPU |
+| Warm CPU rembg request | 2.350 s function / 2.743 s client wall | CPU |
+| SAM3D resident model load | 36.550 s | L40S cold only |
+| SAM3D cold inference | 21.229 s | L40S |
+| SAM3D cold method | 26.571 s | L40S |
+| SAM3D cold client wall | 100.882 s | includes Modal cold dispatch/startup |
+| SAM3D warm inference | 10.527 s | same resident L40S instance |
+| SAM3D warm method | 15.562 s | same resident L40S instance |
+| SAM3D warm client wall | **15.893 s** | same resident L40S instance |
+| CPU PyVista decimation | 7.637 s | CPU |
+| CPU xatlas UV unwrap | 10.353 s | CPU |
+| CPU mesh/UV stage total | **22.230 s** | CPU |
+| Lite-GPU 24-view gsplat render | 0.948 s | L40S, no SAM3D |
+| Lite-GPU texture bake | 1.249 s | L40S, no SAM3D |
+| Lite-GPU function total | **6.155 s** | L40S, no SAM3D |
+| CPU finalize + validation | **2.728 s** | CPU |
+
+The two SAM3D calls returned the exact same resident `instance_id`, proving that the 90-second
+`scaledown_window` reused the loaded model. Client wall time fell from 100.882 s cold to 15.893 s
+warm. The warm inference itself also improved from 21.229 s to 10.527 s after CUDA/model warm-up.
+
+The original 884,192-face mesh made direct xatlas unwrap take more than five minutes. The production
+CPU stage now uses PyVista decimation before UV unwrap. On this sample it reduced 884,192 faces to
+88,418 faces in 7.637 s, followed by xatlas in 10.353 s. EmbodiedGen v2's own `backproject_v3`
+defaults to `n_max_faces=50000`, so this ~88k-face validation profile remains more conservative than
+the upstream default while cutting UV latency dramatically.
+
+The Lite L40S stage does not load the 13 GB SAM3D model. Its actual function time was only 6.155 s,
+with ~2.2 s spent on the measured gsplat render + texture bake. A totally cold Modal invocation has
+additional scheduling/container-start latency, but that cold-start cost is independent of SAM3D
+weight loading and can be amortized with the Lite worker's short keep-warm window for burst traffic.
+
+Final split-run validation succeeded with:
+
+- 94,852 PLY Gaussians;
+- 55,355 textured OBJ vertices;
+- 88,418 OBJ faces;
+- one valid GLB geometry;
+- valid URDF mesh reference;
+- generated preview video;
+- `VALIDATION_OK`.

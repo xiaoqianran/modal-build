@@ -16,19 +16,20 @@ import modal
 
 TAG = "embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1"
 RELEASE = f"https://github.com/xiaoqianran/modal-build/releases/download/{TAG}"
-APP_NAME = "embodiedgen-v2-l40s-consumer"
+APP_NAME = "modal-3d-embodiedgen"
 
 app = modal.App(APP_NAME)
-data = modal.Volume.from_name("embodiedgen-v2-data", create_if_missing=True)
+weights = modal.Volume.from_name("modal-3d-embodiedgen-weights", create_if_missing=True)
+artifacts = modal.Volume.from_name("modal-3d-artifacts", create_if_missing=True)
 
 ENV = {
     "DEBIAN_FRONTEND": "noninteractive",
     "PYTHONUNBUFFERED": "1",
     "PIP_DISABLE_PIP_VERSION_CHECK": "1",
-    "HF_HOME": "/data/hf",
-    "MODELSCOPE_CACHE": "/data/modelscope",
-    "TORCH_HOME": "/data/torch",
-    "U2NET_HOME": "/data/u2net",
+    "HF_HOME": "/weights/hf",
+    "MODELSCOPE_CACHE": "/weights/modelscope",
+    "TORCH_HOME": "/weights/torch",
+    "U2NET_HOME": "/weights/u2net",
     "PYOPENGL_PLATFORM": "egl",
     "TORCH_CUDA_ARCH_LIST": "8.9",
 }
@@ -142,158 +143,457 @@ image = (
 )
 
 
-def _prepare_weights() -> dict:
-    os.environ.update({"TORCH_HOME": "/data/torch", "U2NET_HOME": "/data/u2net"})
-    target = Path("/data/weights/sam-3d-objects")
+
+def _weights_info() -> dict:
+    target = Path("/weights/sam-3d-objects")
     marker = target / "checkpoints/pipeline.yaml"
     if not marker.exists():
         raise RuntimeError("SAM3D weights missing; run preload_weights first")
-    return {"path": str(target), "size": subprocess.check_output(["du", "-sh", str(target)], text=True).split()[0]}
+    return {
+        "path": str(target),
+        "size": subprocess.check_output(["du", "-sh", str(target)], text=True).split()[0],
+    }
 
 
-@app.function(image=image, volumes={"/data": data}, timeout=60 * 60, cpu=4.0, memory=16384)
+@app.function(
+    image=image,
+    volumes={"/weights": weights},
+    timeout=60 * 60,
+    cpu=4.0,
+    memory=16384,
+)
 def preload_weights():
-    os.environ.update({"TORCH_HOME": "/data/torch", "U2NET_HOME": "/data/u2net"})
-    u2net = Path("/data/u2net/u2net.onnx")
+    """CPU-only model/cache pull for a fresh Modal workspace."""
+    os.environ.update({"TORCH_HOME": "/weights/torch", "U2NET_HOME": "/weights/u2net"})
+    t0 = time.perf_counter()
+    u2net = Path("/weights/u2net/u2net.onnx")
     if not u2net.exists():
         import urllib.request
         u2net.parent.mkdir(parents=True, exist_ok=True)
-        urllib.request.urlretrieve("https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx", str(u2net))
-    dino = Path("/data/torch/hub/checkpoints/dinov2_vitl14_reg4_pretrain.pth")
-    repo = Path("/data/torch/hub/facebookresearch_dinov2_main")
-    if not dino.exists() or not repo.exists():
+        print("CPU ONLY: downloading U2Net", flush=True)
+        urllib.request.urlretrieve(
+            "https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2net.onnx",
+            str(u2net),
+        )
+
+    dino = Path("/weights/torch/hub/checkpoints/dinov2_vitl14_reg4_pretrain.pth")
+    dino_repo = Path("/weights/torch/hub/facebookresearch_dinov2_main")
+    if not dino.exists() or not dino_repo.exists():
+        print("CPU ONLY: downloading DINOv2 repo + ViT-L/14 reg4", flush=True)
         import torch
-        m = torch.hub.load("facebookresearch/dinov2", "dinov2_vitl14_reg", pretrained=True, trust_repo=True)
+        m = torch.hub.load(
+            "facebookresearch/dinov2",
+            "dinov2_vitl14_reg",
+            pretrained=True,
+            trust_repo=True,
+        )
         del m
-    target = Path("/data/weights/sam-3d-objects")
+
+    target = Path("/weights/sam-3d-objects")
     marker = target / "checkpoints/pipeline.yaml"
     if not marker.exists():
+        print("CPU ONLY: downloading SAM3D weights", flush=True)
         from modelscope import snapshot_download
-        target.parent.mkdir(parents=True, exist_ok=True)
         snapshot_download("facebook/sam-3d-objects", local_dir=str(target))
-    data.commit()
-    return _prepare_weights()
+    weights.commit()
+    info = _weights_info()
+    info["seconds"] = round(time.perf_counter() - t0, 3)
+    print("WEIGHTS_READY", json.dumps(info), flush=True)
+    return info
+
+
+@app.function(
+    image=image,
+    volumes={"/weights": weights, "/artifacts": artifacts},
+    timeout=10 * 60,
+    cpu=4.0,
+    memory=16384,
+)
+def prepare_sample(job_id: str) -> dict:
+    """CPU-only background removal and input staging."""
+    t0=time.perf_counter()
+    os.chdir("/workspace/EmbodiedGen")
+    os.environ.update({"U2NET_HOME":"/weights/u2net", "TORCH_HOME":"/weights/torch"})
+    from PIL import Image
+    import rembg
+
+    root=Path("/artifacts/embodiedgen/jobs")/job_id
+    root.mkdir(parents=True,exist_ok=True)
+    src=Path("apps/assets/example_image/sample_00.jpg")
+    raw=root/"sample_00_raw.png"
+    cond=root/"sample_00_cond.png"
+    image=Image.open(src)
+    image.save(raw)
+    # Equivalent to EmbodiedGen's RembgRemover without importing the very heavy
+    # segment_model module (SAM/Transformers/etc.). Preserve its max-size=1024 rule.
+    current_max=max(image.size)
+    scale=min(1.0,1024.0/current_max)
+    if scale < 1.0:
+        image=image.resize((int(image.width*scale),int(image.height*scale)),Image.Resampling.LANCZOS)
+    session=rembg.new_session("u2net")
+    rembg.remove(image,session=session).save(cond)
+    artifacts.commit()
+    out={"job_id":job_id,"raw":str(raw),"cond":str(cond),"seconds":round(time.perf_counter()-t0,3)}
+    print("PREPARE_OK",json.dumps(out),flush=True)
+    return out
+
+
+@app.cls(
+    image=image,
+    gpu="L40S",
+    volumes={"/weights": weights, "/artifacts": artifacts},
+    cpu=6.0,
+    memory=32768,
+    min_containers=0,
+    max_containers=1,
+    scaledown_window=90,
+    timeout=30 * 60,
+)
+class Sam3DWorker:
+    """Heavy L40S worker: keep the 13GB SAM3D pipeline resident for 90s."""
+
+    @modal.enter()
+    def load(self):
+        t0=time.perf_counter()
+        os.chdir("/workspace/EmbodiedGen")
+        os.environ.update({"TORCH_HOME":"/weights/torch", "U2NET_HOME":"/weights/u2net"})
+        assert subprocess.run(["bash","-lc","command -v nvcc"],capture_output=True).returncode != 0
+        import torch
+        from embodied_gen.models.sam3d import Sam3dInference
+        import uuid
+        self.torch=torch
+        self.pipeline=Sam3dInference(local_dir="/weights/sam-3d-objects")
+        torch.cuda.synchronize()
+        self.load_seconds=time.perf_counter()-t0
+        self.instance_id=uuid.uuid4().hex
+        print(f"SAM3D_RESIDENT_READY instance_id={self.instance_id} load_seconds={self.load_seconds:.3f}",flush=True)
+
+    @modal.method()
+    def generate(self, job_id: str, seed: int = 0) -> dict:
+        import pickle
+        import numpy as np
+        from PIL import Image
+        from embodied_gen.models.gs_model import GaussianOperator
+        from embodied_gen.utils.trender import pack_state
+
+        t0=time.perf_counter()
+        artifacts.reload()
+        root=Path("/artifacts/embodiedgen/jobs")/job_id
+        cond=root/"sample_00_cond.png"
+        if not cond.exists(): raise FileNotFoundError(cond)
+        image=Image.open(cond).convert("RGBA")
+        i0=time.perf_counter()
+        outputs=self.pipeline.run(image,seed=seed)
+        self.torch.cuda.synchronize()
+        i1=time.perf_counter()
+        gs=outputs["gaussian"][0]; mesh=outputs["mesh"][0]
+        gs_path=root/"sample_00_gs.ply"
+        gs.save_ply(str(gs_path))
+        rot_matrix=np.array([[0,0,-1],[0,1,0],[1,0,0]])
+        gs_add_rot=np.array([[1,0,0],[0,-1,0],[0,0,-1]])
+        pose=GaussianOperator.trans_to_quatpose(gs_add_rot @ rot_matrix)
+        aligned=root/"sample_00_gs_aligned.ply"
+        GaussianOperator.resave_ply(str(gs_path),str(aligned),instance_pose=pose,device="cpu")
+        state=pack_state(gs,mesh)
+        with (root/"sample_00_state.pkl").open("wb") as f:
+            pickle.dump(state,f,protocol=pickle.HIGHEST_PROTOCOL)
+        del outputs,gs,mesh,state
+        self.torch.cuda.empty_cache()
+        artifacts.commit()
+        result={
+            "job_id":job_id,
+            "instance_id":self.instance_id,
+            "resident_model_load_seconds":round(self.load_seconds,3),
+            "inference_seconds":round(i1-i0,3),
+            "method_seconds":round(time.perf_counter()-t0,3),
+            "gpu":self.torch.cuda.get_device_name(0),
+        }
+        print("SAM3D_GENERATE_OK",json.dumps(result),flush=True)
+        return result
+
+
+@app.function(
+    image=image,
+    volumes={"/artifacts": artifacts},
+    timeout=30 * 60,
+    cpu=8.0,
+    memory=32768,
+)
+def cpu_xatlas(job_id: str) -> dict:
+    """Pure CPU: mesh orientation, normalization and xatlas UV unwrap."""
+    import pickle
+    import numpy as np
+    import trimesh
+    import pyvista as pv
+    import xatlas
+
+    t0=time.perf_counter()
+    artifacts.reload()
+    root=Path("/artifacts/embodiedgen/jobs")/job_id
+    with (root/"sample_00_state.pkl").open("rb") as f: state=pickle.load(f)
+    vertices=np.asarray(state["mesh"]["vertices"],dtype=np.float32)
+    faces=np.asarray(state["mesh"]["faces"],dtype=np.int32)
+    input_vertices,input_faces=len(vertices),len(faces)
+
+    mesh_add_rot=np.array([[1,0,0],[0,0,-1],[0,1,0]],dtype=np.float32)
+    rot_matrix=np.array([[0,0,-1],[0,1,0],[1,0,0]],dtype=np.float32)
+    vertices=vertices @ mesh_add_rot
+    vertices=vertices @ rot_matrix
+    raw=trimesh.Trimesh(vertices=vertices,faces=faces,process=False)
+    raw.export(root/"sample_00_raw_mesh.obj")
+
+    # UV unwrap cost scales badly with triangle count. EmbodiedGen's own v3 path
+    # defaults to n_max_faces=50k; keep ~10% here (~90k on this sample) as a
+    # quality/speed compromise while staying fully CPU-only.
+    pv_faces=np.hstack([np.full((len(faces),1),3,dtype=np.int64),faces.astype(np.int64)]).ravel()
+    poly=pv.PolyData(vertices,pv_faces)
+    d0=time.perf_counter(); dec=poly.decimate(0.90,progress_bar=False); d1=time.perf_counter()
+    vertices=np.asarray(dec.points,dtype=np.float32)
+    faces=np.asarray(dec.faces,dtype=np.int64).reshape(-1,4)[:,1:].astype(np.int32)
+
+    bbmin=vertices.min(0); bbmax=vertices.max(0)
+    center=(bbmin+bbmax)*0.5
+    scale=np.float32(2.0/(bbmax-bbmin).max())
+    norm=(vertices-center)*scale
+    x_rot=np.array([[1,0,0],[0,0,1],[0,-1,0]],dtype=np.float32)
+    z_rot=np.array([[0,1,0],[-1,0,0],[0,0,1]],dtype=np.float32)
+    norm=norm @ x_rot
+    norm=norm @ z_rot
+
+    x0=time.perf_counter()
+    vmapping,indices,uvs=xatlas.parametrize(norm,faces)
+    x1=time.perf_counter()
+    baked_vertices=norm[vmapping]
+    np.savez_compressed(
+        root/"bake_mesh.npz",
+        vertices=baked_vertices.astype(np.float32),
+        faces=np.asarray(indices,dtype=np.int32),
+        uvs=np.asarray(uvs,dtype=np.float32),
+        scale=np.asarray(scale,dtype=np.float32),
+        center=center.astype(np.float32),
+        x_rot=x_rot,
+        z_rot=z_rot,
+    )
+    artifacts.commit()
+    result={
+        "job_id":job_id,
+        "input_vertices":int(input_vertices),
+        "input_faces":int(input_faces),
+        "dec_vertices":int(len(vertices)),
+        "dec_faces":int(len(faces)),
+        "decimate_seconds":round(d1-d0,3),
+        "uv_vertices":int(len(baked_vertices)),
+        "uv_faces":int(len(indices)),
+        "xatlas_seconds":round(x1-x0,3),
+        "total_seconds":round(time.perf_counter()-t0,3),
+    }
+    print("CPU_XATLAS_OK",json.dumps(result),flush=True)
+    return result
 
 
 @app.function(
     image=image,
     gpu="L40S",
-    timeout=5 * 60,
-    cpu=2.0,
-    memory=8192,
+    volumes={"/artifacts": artifacts},
+    timeout=15 * 60,
+    cpu=4.0,
+    memory=16384,
     min_containers=0,
-    scaledown_window=10,
+    scaledown_window=30,
 )
-def extensions_smoke() -> dict:
-    """Cheap proof that release .so files execute without nvcc/c++ available."""
-    t0=time.perf_counter()
-    assert subprocess.run(["bash","-lc","command -v nvcc || command -v c++"],capture_output=True).returncode != 0
+def lite_gpu_bake(job_id: str) -> dict:
+    """Light L40S: gsplat multiview render + texture bake; no SAM3D model."""
+    import math
+    import numpy as np
     import torch
+    import imageio.v2 as imageio
+    from PIL import Image
     from gsplat import rasterization
-    import nvdiffrast.torch as dr
+    from embodied_gen.data.utils import CameraSetting, init_kal_camera, post_process_texture
+    from embodied_gen.data.backproject_v3 import TextureBaker
+    from embodied_gen.models.gs_model import load_gs_model
 
-    # nvdiffrast: rasterize one clip-space triangle.
-    ctx=dr.RasterizeCudaContext()
-    pos=torch.tensor([[[-0.5,-0.5,0.0,1.0],[0.5,-0.5,0.0,1.0],[0.0,0.5,0.0,1.0]]],device="cuda",dtype=torch.float32)
-    tri=torch.tensor([[0,1,2]],device="cuda",dtype=torch.int32)
-    rast,_=dr.rasterize(ctx,pos,tri,resolution=[64,64])
-    torch.cuda.synchronize()
+    t0=time.perf_counter()
+    artifacts.reload()
+    root=Path("/artifacts/embodiedgen/jobs")/job_id
+    d=np.load(root/"bake_mesh.npz")
+    vertices=d["vertices"]; faces=d["faces"]; uvs=d["uvs"]
+    cp=CameraSetting(num_images=24,elevation=[0],distance=5.0,resolution_hw=(512,512),fov=math.radians(30),device="cuda")
+    cam=init_kal_camera(cp,flip_az=True)
+    mv=cam.view_matrix(); mv[:,:3,3]=-mv[:,:3,3]
+    K=torch.tensor(cp.Ks,device="cuda")
+    model=load_gs_model(str(root/"sample_00_gs_aligned.ply"),pre_quat=[0.,0.,1.,0.])
+    views=[]
+    r0=time.perf_counter()
+    for m in mv:
+        c2w=torch.linalg.inv(m.to("cuda")); gs=model.get_gaussians(c2w,apply_activate=True)
+        renders,_,_=rasterization(
+            means=gs._means,quats=gs._quats,scales=gs._scales,
+            opacities=gs._opacities.squeeze(),colors=gs._rgbs,
+            viewmats=torch.linalg.inv(c2w)[None,...],Ks=K[None,...],width=512,height=512,
+            packed=False,absgrad=True,sparse_grad=False,rasterize_mode="antialiased",
+            near_plane=0.01,far_plane=1_000_000_000,radius_clip=0.0,render_mode="RGB")
+        torch.cuda.synchronize()
+        views.append((renders[0,...,:3].clamp(0,1)*255).to(torch.uint8).cpu().numpy())
+    r1=time.perf_counter()
 
-    # gsplat: rasterize a tiny cloud.
-    n=64
-    means=torch.randn(n,3,device="cuda"); means[:,2].abs_().add_(3.0)
-    quats=torch.randn(n,4,device="cuda"); quats=quats/quats.norm(dim=-1,keepdim=True)
-    scales=torch.full((n,3),0.03,device="cuda")
-    op=torch.full((n,),0.5,device="cuda")
-    colors=torch.rand(n,3,device="cuda")
-    view=torch.eye(4,device="cuda")[None]
-    K=torch.tensor([[100.,0.,32.],[0.,100.,32.],[0.,0.,1.]],device="cuda")[None]
-    rgb,alpha,_=rasterization(means,quats,scales,op,colors,view,K,64,64)
-    torch.cuda.synchronize()
-    out={
+    b0=time.perf_counter()
+    baker=TextureBaker(vertices,faces,uvs,cp,device="cuda")
+    texture=baker.bake_texture([v[...,:3] for v in views],texture_size=1024,mode="fast")
+    texture=post_process_texture(texture)
+    b1=time.perf_counter()
+    Image.fromarray(texture).save(root/"texture.png")
+
+    # Preview is nearly free compared with model inference; reuse horizontal gsplat orbit.
+    preview=[]
+    cpv=CameraSetting(num_images=60,elevation=[0],distance=5.0,resolution_hw=(512,512),fov=math.radians(30),device="cuda")
+    camv=init_kal_camera(cpv,flip_az=True); mvv=camv.view_matrix(); mvv[:,:3,3]=-mvv[:,:3,3]
+    Kv=torch.tensor(cpv.Ks,device="cuda")
+    for m in mvv:
+        c2w=torch.linalg.inv(m.to("cuda")); gs=model.get_gaussians(c2w,apply_activate=True)
+        rr,_,_=rasterization(means=gs._means,quats=gs._quats,scales=gs._scales,
+            opacities=gs._opacities.squeeze(),colors=gs._rgbs,
+            viewmats=torch.linalg.inv(c2w)[None,...],Ks=Kv[None,...],width=512,height=512,
+            packed=False,absgrad=True,sparse_grad=False,rasterize_mode="antialiased",
+            near_plane=0.01,far_plane=1_000_000_000,radius_clip=0.0,render_mode="RGB")
+        torch.cuda.synchronize()
+        preview.append((rr[0,...,:3].clamp(0,1)*255).to(torch.uint8).cpu().numpy())
+    imageio.mimsave(str(root/"preview.mp4"),preview,fps=30,codec="libx264")
+    artifacts.commit()
+    result={
+        "job_id":job_id,
         "gpu":torch.cuda.get_device_name(0),
-        "torch":str(torch.__version__),
-        "cuda":str(torch.version.cuda),
-        "cc":list(torch.cuda.get_device_capability(0)),
-        "nvcc_present":False,
-        "nvdiffrast_shape":list(rast.shape),
-        "gsplat_shape":list(rgb.shape),
-        "seconds":round(time.perf_counter()-t0,3),
+        "render24_seconds":round(r1-r0,3),
+        "bake_seconds":round(b1-b0,3),
+        "total_seconds":round(time.perf_counter()-t0,3),
     }
-    print("EXTENSIONS_SMOKE_OK",json.dumps(out),flush=True)
-    return out
-
-
-@app.function(
-    image=image, gpu="L40S", volumes={"/data": data}, timeout=60 * 60,
-    cpu=6.0, memory=32768, min_containers=0, scaledown_window=300,
-)
-def benchmark_once(label: str = "run") -> dict:
-    """One end-to-end request. Repeated calls can reuse the same warm container."""
-    t0 = time.perf_counter()
-    os.chdir("/workspace/EmbodiedGen")
-    w = _prepare_weights()
-    local = Path("weights/sam-3d-objects")
-    local.parent.mkdir(exist_ok=True)
-    if local.is_symlink(): local.unlink()
-    if not local.exists(): local.symlink_to(Path(w["path"]), target_is_directory=True)
-
-    # Hard proof that this is a release consumer, not a builder.
-    assert subprocess.run(["bash", "-lc", "command -v nvcc"], capture_output=True).returncode != 0
-    import torch
-    from gsplat.cuda._backend import _C as gsplat_C
-    import nvdiffrast.torch as dr
-    cuda_ready = time.perf_counter()
-    _ = gsplat_C
-    _ = dr.RasterizeCudaContext()
-    ext_ready = time.perf_counter()
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out = Path(f"/data/benchmarks/{stamp}-{label}")
-    out.mkdir(parents=True, exist_ok=True)
-
-    cmd = ["img3d-cli", "--image_path", "apps/assets/example_image/sample_00.jpg", "--output_root", str(out), "--n_retry", "1", "--image3d_model", "SAM3D", "--keep_intermediate"]
-    env = os.environ.copy(); env["MODAL_GENERATE_ONLY"] = "1"
-    g0 = time.perf_counter(); subprocess.run(cmd, check=True, env=env); g1 = time.perf_counter()
-
-    post = ["python", "-m", "embodied_gen.scripts.modal_postprocess", "--output_root", str(out), "--filename", "sample_00", "--texture_size", "1024", "--video_frames", "60", "--fast_bake", "--skip_fix_mesh", "--disable_decompose_convex", "--skip_aesthetic"]
-    p0 = time.perf_counter(); subprocess.run(post, check=True); p1 = time.perf_counter()
-
-    report = json.loads((out / "validation_report.json").read_text())
-    t1 = time.perf_counter()
-    result = {
-        "label": label,
-        "gpu": torch.cuda.get_device_name(0),
-        "torch": str(torch.__version__),
-        "torch_cuda": str(torch.version.cuda),
-        "compute_capability": list(torch.cuda.get_device_capability(0)),
-        "nvcc_present": False,
-        "weights": w,
-        "seconds": {
-            "function_start_to_cuda_ready": round(cuda_ready - t0, 3),
-            "precompiled_extensions_ready": round(ext_ready - cuda_ready, 3),
-            "sam3d_generate": round(g1 - g0, 3),
-            "postprocess": round(p1 - p0, 3),
-            "function_total": round(t1 - t0, 3),
-        },
-        "validation": report.get("checks", {}),
-        "output": str(out),
-    }
-    (out / "benchmark.json").write_text(json.dumps(result, indent=2) + "\n")
-    data.commit()
-    print("BENCHMARK_RESULT", json.dumps(result, ensure_ascii=False), flush=True)
+    print("LITE_GPU_BAKE_OK",json.dumps(result),flush=True)
     return result
 
 
+@app.function(
+    image=image,
+    volumes={"/artifacts": artifacts},
+    timeout=15 * 60,
+    cpu=4.0,
+    memory=16384,
+)
+def cpu_finalize(job_id: str) -> dict:
+    """Pure CPU: restore mesh scale, export OBJ/GLB, write fallback URDF and validate."""
+    import json as _json
+    import shutil
+    import xml.etree.ElementTree as ET
+    import numpy as np
+    import trimesh
+    from PIL import Image
+
+    t0=time.perf_counter()
+    artifacts.reload()
+    root=Path("/artifacts/embodiedgen/jobs")/job_id
+    d=np.load(root/"bake_mesh.npz")
+    vertices=d["vertices"]; faces=d["faces"]; uvs=d["uvs"]
+    scale=float(d["scale"]); center=d["center"]; x_rot=d["x_rot"]; z_rot=d["z_rot"]
+    vertices=vertices @ np.linalg.inv(z_rot)
+    vertices=vertices @ np.linalg.inv(x_rot)
+    vertices=vertices/scale + center
+    texture=Image.open(root/"texture.png").convert("RGB")
+    mesh=trimesh.Trimesh(vertices=vertices,faces=faces,
+        visual=trimesh.visual.TextureVisuals(uv=uvs,image=texture),process=True)
+    obj=root/"sample_00.obj"; glb=root/"sample_00.glb"
+    mesh.export(obj); mesh.export(glb)
+
+    result=root/"result"; meshdir=result/"mesh"
+    if result.exists(): shutil.rmtree(result)
+    meshdir.mkdir(parents=True,exist_ok=True)
+    for pth in root.glob("sample_00*.*"):
+        if pth.suffix.lower() in {".obj",".mtl",".glb",".ply"}: shutil.copy2(pth,meshdir/pth.name)
+    for pth in root.glob("*.png"):
+        if pth.name=="texture.png": shutil.copy2(pth,meshdir/pth.name)
+    if (root/"preview.mp4").exists(): shutil.copy2(root/"preview.mp4",result/"video.mp4")
+
+    # GPT-free fallback attributes match the upstream fallback semantics.
+    robot=ET.Element("robot",{"name":"sample_00"})
+    link=ET.SubElement(robot,"link",{"name":"sample_00"})
+    visual=ET.SubElement(link,"visual"); ET.SubElement(visual,"origin",{"xyz":"0 0 0","rpy":"1.5708 0 1.5708"})
+    geom=ET.SubElement(visual,"geometry"); ET.SubElement(geom,"mesh",{"filename":"mesh/sample_00.obj","scale":"1 1 1"})
+    collision=ET.SubElement(link,"collision"); ET.SubElement(collision,"origin",{"xyz":"0 0 0","rpy":"1.5708 0 1.5708"})
+    cgeom=ET.SubElement(collision,"geometry"); ET.SubElement(cgeom,"mesh",{"filename":"mesh/sample_00.obj","scale":"1 1 1"})
+    inertial=ET.SubElement(link,"inertial"); ET.SubElement(inertial,"mass",{"value":"1.0"})
+    extra=ET.SubElement(link,"extra_info")
+    for k,v in {"category":"unknown","description":"unknown","real_height":"1.0","version":"2.0.0","gs_model":"mesh/sample_00_gs.ply"}.items(): ET.SubElement(extra,k).text=v
+    urdf=result/"sample_00.urdf"; ET.ElementTree(robot).write(urdf,encoding="utf-8",xml_declaration=True)
+
+    # Structural validation.
+    objm=trimesh.load(obj,force="mesh"); glbs=trimesh.load(glb,force="scene")
+    ET.parse(urdf)
+    with (root/"sample_00_gs.ply").open("rb") as f: header=f.read(8192).decode("ascii","ignore")
+    ply_vertices=next(int(x.split()[-1]) for x in header.splitlines() if x.startswith("element vertex "))
+    checks={
+        "ply_vertices":ply_vertices,
+        "obj_vertices":int(len(objm.vertices)),
+        "obj_faces":int(len(objm.faces)),
+        "glb_geometries":int(len(glbs.geometry)),
+        "urdf_mesh_exists":(result/"mesh/sample_00.obj").exists(),
+        "video_exists":(result/"video.mp4").exists(),
+    }
+    if not all([checks["ply_vertices"]>0,checks["obj_vertices"]>0,checks["obj_faces"]>0,checks["glb_geometries"]>0,checks["urdf_mesh_exists"]]):
+        raise RuntimeError(checks)
+    report={"job_id":job_id,"checks":checks,"seconds":round(time.perf_counter()-t0,3)}
+    (root/"validation_report.json").write_text(_json.dumps(report,indent=2)+"\n")
+    artifacts.commit()
+    print("VALIDATION_OK",_json.dumps(report),flush=True)
+    return report
+
+
 @app.local_entrypoint()
-def benchmark():
-    print("CPU preload/check:", preload_weights.remote(), flush=True)
-    rows = []
-    for label in ("cold", "warm"):
-        wall0 = time.perf_counter()
-        r = benchmark_once.remote(label)
-        wall = time.perf_counter() - wall0
-        r["seconds"]["client_wall"] = round(wall, 3)
-        rows.append(r)
-        print(label.upper(), json.dumps(r, indent=2, ensure_ascii=False), flush=True)
-    print("BENCHMARK_SUMMARY", json.dumps(rows, indent=2, ensure_ascii=False), flush=True)
+def benchmark_split():
+    """Prepare both jobs first, then measure cold→warm resident SAM3D back-to-back."""
+    print("WEIGHTS", preload_weights.remote(), flush=True)
+    worker = Sam3DWorker()
+
+    jobs=[]
+    # Prepare both inputs before allocating the heavy GPU. This prevents CPU rembg
+    # latency from consuming the 90-second SAM3D keep-warm window.
+    for label in ("cold","warm"):
+        job_id=f"bench-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{label}"
+        p0=time.perf_counter(); prep=prepare_sample.remote(job_id); pwall=time.perf_counter()-p0
+        jobs.append({"label":label,"job_id":job_id,"prepare":prep,"prepare_client_wall":round(pwall,3)})
+        print(f"PREPARED_{label.upper()}",json.dumps(jobs[-1],ensure_ascii=False,indent=2),flush=True)
+
+    # Heavy GPU calls are now consecutive.
+    for item in jobs:
+        g0=time.perf_counter(); gen=worker.generate.remote(item["job_id"]); gwall=time.perf_counter()-g0
+        item["sam3d"]=gen; item["sam3d_client_wall"]=round(gwall,3)
+        print(f"SAM3D_{item['label'].upper()}",json.dumps(item,ensure_ascii=False,indent=2),flush=True)
+
+    same_instance=jobs[0]["sam3d"]["instance_id"]==jobs[1]["sam3d"]["instance_id"]
+    reuse={
+        "same_instance":same_instance,
+        "cold_instance":jobs[0]["sam3d"]["instance_id"],
+        "warm_instance":jobs[1]["sam3d"]["instance_id"],
+        "cold_client_wall":jobs[0]["sam3d_client_wall"],
+        "warm_client_wall":jobs[1]["sam3d_client_wall"],
+        "model_load_seconds":jobs[0]["sam3d"]["resident_model_load_seconds"],
+        "cold_inference_seconds":jobs[0]["sam3d"]["inference_seconds"],
+        "warm_inference_seconds":jobs[1]["sam3d"]["inference_seconds"],
+    }
+    print("SAM3D_WARM_REUSE",json.dumps(reuse,ensure_ascii=False),flush=True)
+    if not same_instance:
+        raise RuntimeError("warm benchmark did not reuse the resident SAM3D instance")
+
+    # Downstream stages happen after the reuse measurement, so the heavy SAM3D
+    # worker can naturally idle then scale to zero while xatlas uses CPU only.
+    for item in jobs:
+        down0=time.perf_counter()
+        x0=time.perf_counter(); xr=cpu_xatlas.remote(item["job_id"]); xwall=time.perf_counter()-x0
+        b0=time.perf_counter(); br=lite_gpu_bake.remote(item["job_id"]); bwall=time.perf_counter()-b0
+        f0=time.perf_counter(); fr=cpu_finalize.remote(item["job_id"]); fwall=time.perf_counter()-f0
+        item.update({
+            "xatlas":xr,"xatlas_client_wall":round(xwall,3),
+            "lite_gpu":br,"lite_gpu_client_wall":round(bwall,3),
+            "final":fr,"final_client_wall":round(fwall,3),
+            "downstream_wall":round(time.perf_counter()-down0,3),
+        })
+        print(f"PIPELINE_{item['label'].upper()}",json.dumps(item,ensure_ascii=False,indent=2),flush=True)
+
+    print("SPLIT_BENCHMARK_SUMMARY",json.dumps({"reuse":reuse,"jobs":jobs},ensure_ascii=False,indent=2),flush=True)
