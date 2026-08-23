@@ -733,3 +733,152 @@ for these API/TTL validations.
 The API is therefore deliberately not a workflow framework: there is no database server, Redis,
 Celery, custom queue, user-defined DAG or extra GPU service. Modal Dict stores compact job metadata,
 Modal Volume stores artifacts, and the existing workers remain the execution graph.
+
+## Production Job API
+
+The runtime now exposes a thin, authenticated Job API rather than adding a workflow framework. It
+reuses the existing five production stages unchanged and adds only UUID job identity, status,
+result download, and artifact retention.
+
+Current deployment:
+
+```text
+https://shuhuaqaq--modal-3d-embodiedgen-job-api.modal.run
+```
+
+The endpoint uses Modal Proxy Auth (`Modal-Key: wk-...`, `Modal-Secret: ws-...`). It is intentionally
+not public because every accepted image can allocate L40S compute. Proxy credentials are kept outside
+Git; temporary validation tokens are deleted immediately after use.
+
+Submit a raw image body (not multipart):
+
+```bash
+BASE=https://shuhuaqaq--modal-3d-embodiedgen-job-api.modal.run
+curl -sS -X POST "$BASE/jobs?profile=auto" \
+  -H "Modal-Key: $MODAL_PROXY_KEY" \
+  -H "Modal-Secret: $MODAL_PROXY_SECRET" \
+  -H 'Content-Type: application/octet-stream' \
+  --data-binary @image.jpg
+```
+
+The server generates `job-<32 hex chars>`; user input never becomes a filesystem job id. Inputs are
+limited to 20 MiB and 40 megapixels and are validated by Pillow before dispatch. API jobs require an
+uploaded `input_image`; only legacy benchmark jobs retain the repository sample fallback.
+
+Status and result files:
+
+```bash
+curl -sS "$BASE/jobs/$JOB_ID" \
+  -H "Modal-Key: $MODAL_PROXY_KEY" -H "Modal-Secret: $MODAL_PROXY_SECRET"
+
+curl -o model.glb "$BASE/jobs/$JOB_ID/files/glb" \
+  -H "Modal-Key: $MODAL_PROXY_KEY" -H "Modal-Secret: $MODAL_PROXY_SECRET"
+```
+
+Available logical files are `glb`, `obj`, `mtl`, `obj_texture`, `urdf`, `video`, `gs_ply`,
+`gs_aligned_ply`, and `validation`. The OBJ material chain remains self-contained.
+
+The orchestrator is deliberately cheap (`0.25 CPU`, `512 MiB`) and only waits for independently
+scaled workers. Multiple orchestrators may overlap so SAM3D for job N+1 can run while CPU mesh work
+for job N proceeds. Autoscaler changes are process-local deduplicated: requesting the same profile
+again sends zero control-plane updates; a profile transition updates the five managed pools once.
+
+Artifact lifecycle is bounded:
+
+- successful API jobs prune all intermediate state immediately after validation, keeping only
+  `result/` plus `validation_report.json`;
+- failed jobs expire after 24 hours;
+- completed results expire after 7 days;
+- stuck `queued`/`running` jobs become eligible after 6 hours;
+- a 0.25-CPU scheduled cleanup runs every 6 hours and only touches `job-<uuid>` directories, never
+  historical `bench-*` debug artifacts.
+
+### Real API validation
+
+The deployed API was validated on 2026-08-23 without bypassing HTTP:
+
+```text
+POST /jobs?profile=min_cost
+  -> rembg
+  -> SAM3D L40S
+  -> Dict state handoff
+  -> CPU mesh/xatlas
+  -> Lite L40S texture
+  -> CPU finalize
+  -> succeeded
+```
+
+Cold client-observed stage times for this one deliberately cost-minimized validation request were:
+
+```text
+rembg       65.202 s
+sam3d      104.055 s
+mesh        13.536 s
+texture     15.183 s
+finalize    18.747 s
+```
+
+These are **full cold `min_cost`** timings, not the ~30 s warm-path target. Final validation returned
+95,560 Gaussian PLY vertices, 31,783 OBJ vertices, exactly 50,000 OBJ faces, one GLB geometry, valid
+URDF/video/material references, and `VALIDATION_OK`. The finalizer reported 13 intermediate files
+removed; a Volume listing then contained only `result/` and `validation_report.json`.
+
+Billing-delta measurement for that complete cold API E2E was approximately:
+
+```text
+L40S   $0.07803839
+CPU    $0.01506707
+Memory $0.01150332
+Total  $0.10460878
+```
+
+A separate deliberate missing-input orchestrator failure cost about $0.001279 and stopped at Rembg;
+it did not invoke SAM3D. Proxy-auth, authenticated health, invalid-image rejection, status lookup,
+file download, uploaded-image Rembg input, and TTL deletion were also validated without GPU use.
+
+### CPU-image and async warning cleanup
+
+The normal CPU stages now use a dedicated Debian-slim image instead of the CUDA runtime image. The
+pinned CPU image contains only the dependencies required by Rembg, MeshWorker and Finalize
+(`rembg==2.0.61`, `onnxruntime==1.20.1`, `numpy==1.26.4`, `xatlas==0.0.11`,
+`fast-simplification==0.2.0`, `trimesh==5.0.0`, Pillow and their transitive CPU dependencies).
+SAM3D and Lite texture bake remain on the CUDA runtime image.
+
+A real CPU-only regression verified all three CPU stages after the split:
+
+```text
+RembgWorker   REMBG_PREPARE_OK   session load 0.939 s, remove 1.518 s, method 2.135 s
+MeshWorker    MESH_PROCESS_OK    891,852 -> 50,000 faces, xatlas 5.577 s, method 7.658 s
+Finalize      VALIDATION_OK      95,560 PLY, 32,517 OBJ vertices, 50,000 faces
+NVIDIA Driver warning            absent from all three runs
+```
+
+The ASGI submit path also uses Modal's async interfaces end-to-end for Volume commit, Dict traffic/job
+state operations, autoscaler updates and background spawn. Dedicated async regression tests provide
+fake Modal handles exposing only `.aio`; any future accidental sync call in those helpers will fail the
+test rather than reintroduce `AsyncUsageWarning`.
+
+## CPU worker isolation and async API cleanup
+
+Production logs exposed two non-fatal warnings after the first HTTP E2E: CPU workers inherited the
+CUDA runtime image and printed `NVIDIA Driver was not detected`, and the async FastAPI submit route
+used blocking Modal client methods. Both paths are now corrected without changing the 3D model graph.
+
+Rembg, MeshWorker and CPU Finalize share one pinned Debian-slim `cpu_image` containing only the CPU
+runtime packages needed by those stages (`rembg 2.0.61`, `onnxruntime 1.20.1`, `xatlas 0.0.11`,
+`fast-simplification 0.2.0`, `trimesh 5.0.0`, NumPy 1.26.4 and Pillow 11.3.0). Heavy SAM3D and Lite
+texture bake remain on the validated CUDA release image. The benchmark sample is copied into the
+weights Volume by `preload_weights`, so the CPU image does not need an EmbodiedGen source checkout.
+
+CPU-only real regressions after the split:
+
+```text
+Rembg:    session load 0.931 s, remove 1.099 s, method 2.135 s, no NVIDIA warning
+Mesh:     891,852 -> 50,000 faces, simplify 1.166 s, xatlas 4.208 s, method 8.619 s
+Finalize: VALIDATION_OK, 95,560 PLY / 32,517 OBJ verts / 50,000 faces
+Log scan: no `NVIDIA Driver was not detected` or `GPU functionality will not be available`
+```
+
+The ASGI submit path now uses Modal `.aio()` interfaces for Volume commits, Dict writes, autoscaler
+updates and background dispatch. `autoscale_policy_check` itself runs the same async control path; a
+real Modal control-only run selected `min_cost` and completed with **no `AsyncUsageWarning`**.

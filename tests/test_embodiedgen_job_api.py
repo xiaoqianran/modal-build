@@ -132,5 +132,96 @@ class AutoscaleDedupeTest(unittest.TestCase):
         self.assertEqual(runtime._active_autoscale_profile, "cost_first")
 
 
+class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
+    class AsyncCall:
+        def __init__(self, fn):
+            self.aio = fn
+
+    class AsyncItems:
+        def __init__(self, data):
+            self.data = data
+
+        def aio(self):
+            async def iterate():
+                for item in list(self.data.items()):
+                    yield item
+            return iterate()
+
+    class FakeTraffic:
+        def __init__(self):
+            self.data = {}
+            self.put = AsyncControlPlaneTest.AsyncCall(self._put)
+            self.pop = AsyncControlPlaneTest.AsyncCall(self._pop)
+            self.items = AsyncControlPlaneTest.AsyncItems(self.data)
+
+        async def _put(self, key, value):
+            self.data[key] = value
+            return True
+
+        async def _pop(self, key, default=None):
+            return self.data.pop(key, default)
+
+    class FakeAutoscalerCall:
+        def __init__(self, owner):
+            self.owner = owner
+            self.aio = self._aio
+
+        async def _aio(self, **kwargs):
+            self.owner.calls.append(kwargs)
+            return kwargs
+
+    class FakeTarget:
+        def __init__(self):
+            self.calls = []
+            self.update_autoscaler = AsyncControlPlaneTest.FakeAutoscalerCall(self)
+
+    async def test_async_profile_selection_uses_only_aio_dict_methods(self):
+        original = runtime.traffic_events
+        fake = self.FakeTraffic()
+        runtime.traffic_events = fake
+        try:
+            first = await runtime.select_request_profile_aio("auto", now=1000.0)
+            second = await runtime.select_request_profile_aio("auto", now=1001.0)
+        finally:
+            runtime.traffic_events = original
+        self.assertEqual(first["selected_profile"], "min_cost")
+        self.assertEqual(second["selected_profile"], "cost_first")
+        self.assertEqual(second["recent_requests_60s"], 2)
+
+    async def test_async_autoscale_updates_all_stages_via_aio(self):
+        runtime._active_autoscale_profile = None
+        handles = tuple(self.FakeTarget() for _ in range(5))
+        await runtime.apply_autoscale_profile_aio("min_cost", handles)
+        self.assertEqual([len(target.calls) for target in handles], [1, 1, 1, 1, 1])
+        self.assertTrue(all(target.calls[0]["scaledown_window"] == 2 for target in handles))
+
+
+class RuntimeIsolationTest(unittest.TestCase):
+    def test_cpu_workers_use_lightweight_cpu_image(self):
+        source = RUNTIME.read_text()
+        for marker in ("class RembgWorker:", "class MeshWorker:", "def cpu_finalize("):
+            pos = source.index(marker)
+            decorator = source[source.rfind("@app.", 0, pos):pos]
+            self.assertIn("image=cpu_image", decorator, marker)
+        self.assertIn("image=image,\n    gpu=\"L40S\"", source)
+
+    def test_async_submit_uses_only_modal_aio_interfaces(self):
+        source = RUNTIME.read_text()
+        start = source.index("    async def submit_job(")
+        end = source.index("    @web.get(\"/jobs/{job_id}\")", start)
+        submit = source[start:end]
+        for blocking in ("artifacts.commit()", "job_states.put(", "run_job.spawn("):
+            self.assertNotIn(blocking, submit)
+        for async_call in ("artifacts.commit.aio()", "job_states.put.aio(", "run_job.spawn.aio("):
+            self.assertIn(async_call, submit)
+
+    def test_benchmark_fallback_is_preloaded_not_source_checkout(self):
+        source = RUNTIME.read_text()
+        self.assertIn('/weights/examples/sample_00.jpg', source)
+        rembg_start = source.index("def _rembg_load")
+        rembg_end = source.index("def _rembg_prepare", rembg_start)
+        self.assertNotIn('/workspace/EmbodiedGen', source[rembg_start:rembg_end])
+
+
 if __name__ == "__main__":
     unittest.main()

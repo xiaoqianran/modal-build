@@ -275,6 +275,42 @@ def validation_passes(checks: dict) -> bool:
     )
 
 
+async def select_request_profile_aio(
+    requested: str = DEFAULT_REQUEST_PROFILE, now: float | None = None
+) -> dict:
+    """Async ASGI variant of select_request_profile; never blocks the event loop."""
+    if requested != "auto":
+        summary = autoscale_profile_summary(requested)
+        return {"requested_profile": requested, "selected_profile": requested, **summary}
+
+    import uuid
+
+    now = time.time() if now is None else float(now)
+    await traffic_events.put.aio(f"{TRAFFIC_EVENT_PREFIX}{now:.6f}:{uuid.uuid4().hex}", now)
+    recent_timestamps=[]
+    stale_keys=[]
+    async for key,timestamp in traffic_events.items.aio():
+        if not str(key).startswith(TRAFFIC_EVENT_PREFIX):
+            continue
+        age=now-float(timestamp)
+        if 0.0 <= age <= AUTO_TRAFFIC_WINDOW_SECONDS:
+            recent_timestamps.append(float(timestamp))
+        elif age > AUTO_TRAFFIC_WINDOW_SECONDS:
+            stale_keys.append(key)
+    for key in stale_keys:
+        await traffic_events.pop.aio(key,None)
+
+    selected,recent=auto_profile_for_timestamps(recent_timestamps,now)
+    summary=autoscale_profile_summary(selected)
+    return {
+        "requested_profile":"auto",
+        "selected_profile":selected,
+        "recent_requests_60s":recent,
+        "pruned_events":len(stale_keys),
+        **summary,
+    }
+
+
 def runtime_handles():
     """Return the single shared pool handles used by every autoscale profile."""
     return RembgWorker(), Sam3DWorker(), MeshWorker(), lite_gpu_bake, cpu_finalize
@@ -305,6 +341,37 @@ def apply_autoscale_profile(profile: str, handles=None) -> tuple:
     _active_autoscale_profile = profile
     return resolved
 
+
+async def apply_autoscale_profile_aio(profile: str, handles=None) -> tuple:
+    """Async ASGI variant; updates the same pool only when the profile changes."""
+    global _active_autoscale_profile
+
+    import asyncio
+
+    cfg=AUTOSCALE_PROFILES.get(profile)
+    if cfg is None:
+        raise ValueError(f"unknown autoscale profile {profile!r}; choose {sorted(AUTOSCALE_PROFILES)}")
+    resolved=handles or runtime_handles()
+    if profile == _active_autoscale_profile:
+        return resolved
+
+    rembg_worker,sam_worker,mesh_worker,lite_worker,finalizer=resolved
+    common={"min_containers":0,"max_containers":1,"buffer_containers":0}
+    autoscalers={
+        "rembg":rembg_worker,
+        "sam3d":sam_worker,
+        "mesh":mesh_worker,
+        "lite":lite_worker,
+        "finalize":finalizer,
+    }
+    await asyncio.gather(*(
+        target.update_autoscaler.aio(scaledown_window=cfg[stage],**common)
+        for stage,target in autoscalers.items()
+    ))
+    _active_autoscale_profile=profile
+    return resolved
+
+
 app = modal.App(APP_NAME)
 weights = modal.Volume.from_name("modal-3d-embodiedgen-weights", create_if_missing=True)
 artifacts = modal.Volume.from_name("modal-3d-artifacts", create_if_missing=True)
@@ -313,6 +380,20 @@ traffic_events = modal.Dict.from_name("modal-3d-embodiedgen-traffic", create_if_
 job_states = modal.Dict.from_name("modal-3d-embodiedgen-jobs", create_if_missing=True)
 control_image = modal.Image.debian_slim(python_version="3.10").pip_install(
     "fastapi==0.116.1", "pillow==11.3.0"
+)
+cpu_image = (
+    modal.Image.debian_slim(python_version="3.10")
+    .env({"PYTHONUNBUFFERED": "1", "PIP_DISABLE_PIP_VERSION_CHECK": "1"})
+    .apt_install("libgomp1")
+    .pip_install(
+        "numpy==1.26.4",
+        "pillow==11.3.0",
+        "rembg==2.0.61",
+        "onnxruntime==1.20.1",
+        "xatlas==0.0.11",
+        "fast-simplification==0.2.0",
+        "trimesh==5.0.0",
+    )
 )
 
 ENV = {
@@ -450,6 +531,13 @@ def preload_weights():
             str(u2net),
         )
 
+    example = Path("/weights/examples/sample_00.jpg")
+    if not example.exists():
+        import shutil
+
+        example.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2("/workspace/EmbodiedGen/apps/assets/example_image/sample_00.jpg", example)
+
     dino = Path("/weights/torch/hub/checkpoints/dinov2_vitl14_reg4_pretrain.pth")
     dino_repo = Path("/weights/torch/hub/facebookresearch_dinov2_main")
     if not dino.exists() or not dino_repo.exists():
@@ -482,7 +570,6 @@ def _rembg_load(worker, cpu_label: str) -> None:
     import rembg
 
     t0=time.perf_counter()
-    os.chdir("/workspace/EmbodiedGen")
     os.environ.update({"U2NET_HOME":"/weights/u2net", "TORCH_HOME":"/weights/torch"})
     worker.session=rembg.new_session("u2net", providers=["CPUExecutionProvider"])
     worker.session_load_seconds=time.perf_counter()-t0
@@ -506,7 +593,7 @@ def _rembg_prepare(worker, job_id: str) -> dict:
     src,source=resolve_job_input(
         job_id,
         root,
-        Path("apps/assets/example_image/sample_00.jpg"),
+        Path("/weights/examples/sample_00.jpg"),
     )
     raw=root/"sample_00_raw.png"
     cond=root/"sample_00_cond.png"
@@ -540,7 +627,7 @@ def _rembg_prepare(worker, job_id: str) -> dict:
 
 
 @app.cls(
-    image=image,
+    image=cpu_image,
     volumes={"/weights": weights, "/artifacts": artifacts},
     cpu=1.0,
     memory=4096,
@@ -660,7 +747,7 @@ class Sam3DWorker:
 
 
 @app.cls(
-    image=image,
+    image=cpu_image,
     volumes={"/artifacts": artifacts},
     cpu=4.0,
     memory=8192,
@@ -931,7 +1018,7 @@ def lite_gpu_bake(job_id: str) -> dict:
 
 
 @app.function(
-    image=image,
+    image=cpu_image,
     volumes={"/artifacts": artifacts},
     timeout=15 * 60,
     cpu=4.0,
@@ -1165,16 +1252,16 @@ def job_api():
         root = api_job_root(job_id)
         root.mkdir(parents=True, exist_ok=False)
         (root / "input_image").write_bytes(body)
-        artifacts.commit()
+        await artifacts.commit.aio()
 
         try:
-            profile_info = select_request_profile(profile)
-            apply_autoscale_profile(profile_info["selected_profile"])
+            profile_info = await select_request_profile_aio(profile)
+            await apply_autoscale_profile_aio(profile_info["selected_profile"])
         except Exception as exc:
             import shutil
 
             shutil.rmtree(root, ignore_errors=True)
-            artifacts.commit()
+            await artifacts.commit.aio()
             raise HTTPException(status_code=503, detail="autoscale setup failed") from exc
 
         now = time.time()
@@ -1190,17 +1277,21 @@ def job_api():
             "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
             "input": {"bytes": len(body), "width": width, "height": height, "format": fmt},
         }
-        job_states.put(job_id, state)
+        await job_states.put.aio(job_id,state)
         try:
-            run_job.spawn(job_id, profile_info["selected_profile"])
+            await run_job.spawn.aio(job_id,profile_info["selected_profile"])
         except Exception as exc:
-            _job_update(
-                job_id,
+            failed=dict(state)
+            failed.update(
                 status="failed",
                 stage="dispatch",
                 error_type=type(exc).__name__,
                 error=str(exc)[:2000],
             )
+            stamp=time.time()
+            failed["updated_epoch"]=stamp
+            failed["updated_at"]=datetime.fromtimestamp(stamp,timezone.utc).isoformat()
+            await job_states.put.aio(job_id,failed)
             raise HTTPException(status_code=503, detail="job dispatch failed") from exc
         return state
 
@@ -1232,10 +1323,10 @@ def job_api():
 
 
 @app.local_entrypoint()
-def autoscale_policy_check(profile: str = DEFAULT_REQUEST_PROFILE):
-    """Validate selection/apply logic in this app run without invoking model workers."""
-    profile_info=select_request_profile(profile)
-    apply_autoscale_profile(profile_info["selected_profile"])
+async def autoscale_policy_check(profile: str = DEFAULT_REQUEST_PROFILE):
+    """Validate the ASGI-safe async control path without invoking model workers."""
+    profile_info=await select_request_profile_aio(profile)
+    await apply_autoscale_profile_aio(profile_info["selected_profile"])
     print("AUTOSCALE_PROFILE",json.dumps(profile_info,ensure_ascii=False,indent=2),flush=True)
 
 
