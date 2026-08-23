@@ -55,6 +55,11 @@ class AutoscalePolicyTest(unittest.TestCase):
         self.assertAlmostEqual(text["text2image_idle_tail_usd"], 0.01996000, places=8)
         self.assertAlmostEqual(text["text_to_3d_idle_tail_total_usd"], 0.05061400, places=8)
 
+    def test_retexture_min_cost_tail_is_isolated(self):
+        summary = runtime.retexture_autoscale_profile_summary("min_cost")
+        self.assertEqual(summary["scaledown_window_seconds"], 2)
+        self.assertAlmostEqual(summary["idle_tail_cost_usd"], 0.00133067, places=8)
+
     def test_unknown_profile_fails_closed(self):
         with self.assertRaises(ValueError):
             runtime.autoscale_profile_summary("unknown")

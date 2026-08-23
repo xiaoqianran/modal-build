@@ -1028,3 +1028,125 @@ production validation cost rather than a warm steady-state estimate.
 Before deployment, the 16.597-GiB Kolors Volume snapshot was also bound to the exact source revision
 with `.modal-build-revision`; both the CPU preload and the paid GPU worker reject a revision mismatch.
 The marker currently matches `7e091c75199e910a26cd1b51ed52c28de5db3711` exactly.
+
+## Production Retexture / Asset Appearance Editing
+
+Phase 3 adds prompt-driven appearance editing for an **existing successful EmbodiedGen job** without
+regenerating geometry. The v1 API deliberately does not accept arbitrary external meshes yet; it
+reuses already validated assets and their existing result/retention/security model:
+
+```text
+POST /jobs/{source_job_id}/retexture
+        │
+        ├── prompt + seed
+        └── source job must be succeeded
+                │
+                ▼
+          RetextureWorker (L40S)
+                │
+                ├── 6-view differentiable geometry/material render
+                ├── Kolors + RoboAssetGen texture ControlNet
+                ├── RealESRGAN x4
+                ├── nvdiffrast UV backprojection
+                └── preview render
+                │
+                ▼
+        OBJ / MTL / texture / GLB / video
+                │
+                └── geometry-preservation validation
+```
+
+### Minimal pinned weight set
+
+The upstream `texture-cli` path can download another full `Kwai-Kolors/Kolors` tree, IP-Adapter and
+Hunyuan Delight weights. Modal v1 avoids that duplication. It reuses the existing pinned
+`Kwai-Kolors/Kolors-diffusers` snapshot from Text→3D and adds only the exact RoboAssetGen texture
+weights required by the no-Delight/no-IP-Adapter path:
+
+```text
+existing Kolors-diffusers                         16.597 GiB (reused)
+RoboAssetGen texture_gen_mv_v1 ControlNet          0.321 GiB
+RoboAssetGen RealESRGAN super_resolution           0.062 GiB
+additional Retexture storage                       ~0.383 GiB
+```
+
+RoboAssetGen is pinned to commit
+`a64fcdebeea17287d830736cd0853df1093b97ab`. `preload_retexture_weights()` downloads the two required
+subtrees on a CPU-only worker, writes a revision marker and commits them to the existing private
+weights Volume. The measured preload was 393 MiB in 6.26 s and did not allocate a GPU.
+
+The L40S worker stays offline. It loads the already pinned Kolors snapshot through
+`KolorsPipeline.from_pretrained(..., variant="fp16", local_files_only=True)`, reuses its tokenizer,
+text encoder, VAE, UNet and scheduler, then attaches the pinned texture ControlNet. This avoids a
+second ~27 GiB Kolors copy. A dedicated compatibility probe loaded the resulting
+`StableDiffusionXLControlNetImg2ImgPipeline` on an L40S successfully in 24.365 s.
+
+### v1 scope
+
+Retexture v1 intentionally fixes:
+
+```text
+delight=False
+ip_adapter=False
+texture diffusion steps=40
+texture_wh=2048x2048
+```
+
+This keeps the additional model footprint small and avoids Hunyuan Delight (~4 GiB) plus Kolors
+IP-Adapter (~2.5 GiB). Those modes can be added later only if measured use cases justify the extra
+storage/cold-start cost.
+
+The upstream `backproject_v2.py` eagerly imported `DelightingModel`; that transitively initialized
+segmentation/quality-check modules and printed `Using GPT model: ...` even when `delight=False`.
+`patches/embodiedgen-v2.0.0/production/retexture-lazy-delight.patch` changes this to a lazy import only
+inside the actual Delight branch. Condition rendering also uses `with_mtl=True` so the source UV/MTL
+bundle is honored. The post-fix E2E log contained zero GPT-init, missing-UV, traceback and OOM lines.
+
+### Geometry-preserving validation
+
+Retexture is allowed to change appearance, not shape. In addition to the normal PLY/OBJ/GLB/URDF,
+video and material-reference checks, the finalizer compares source and output geometry:
+
+- source/output face counts must match;
+- source/output mesh bounds must match within a small numerical tolerance;
+- the source Gaussian PLYs and URDF are carried forward unchanged.
+
+The warning-free dev E2E used source job `job-b9575d82101c4a0da29e9b0706293233` and prompt
+`matte emerald green ceramic with thin gold rim`. The new job completed successfully with:
+
+```text
+resident model load        17.291 s
+condition render            1.913 s
+texture diffusion          28.588 s
+backprojection             13.637 s
+preview render              6.595 s
+worker method              58.148 s
+orchestrator stage wall   100.979 s
+
+source OBJ faces           50,000
+output OBJ faces           50,000
+output OBJ vertices        28,519
+PLY Gaussian vertices      76,404
+GLB geometries                  1
+source_geometry_preserved    true
+material references           OK
+```
+
+The authenticated dev API returned HTTP 200 for validation, GLB, video, OBJ, MTL and texture. The
+source 1024x1024 texture and new 2048x2048 texture were compared numerically: mean absolute RGB
+difference was 106.466 (RMSE 122.47), with different hashes and `identical=False`, proving the
+appearance actually changed while geometry remained fixed.
+
+The same warning-free dev app was scanned after completion:
+
+```text
+Using GPT model                              0 matches
+Missing uvmap; cannot texturemap materials  0 matches
+Traceback                                    0 matches
+OOM / out of memory                          0 matches
+```
+
+Measured Modal cost for that warning-free cold/dev Retexture E2E was `$0.07673937` total:
+`$0.06167654` L40S, `$0.00672025` CPU and `$0.00834258` memory. This is a cold/dev baseline rather
+than a warm per-edit SLA. The independent `min_cost` Retexture autoscale tail is only about
+`$0.00133067` for its 2-second scaledown window.

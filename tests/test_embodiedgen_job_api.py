@@ -180,6 +180,40 @@ class AutoscaleDedupeTest(unittest.TestCase):
         self.assertEqual(runtime._active_autoscale_profile, "cost_first")
 
 
+class RetextureJobTest(unittest.TestCase):
+    def test_retexture_worker_is_single_l40s_offline_pipeline(self):
+        source = RUNTIME.read_text()
+        pos = source.index("class RetextureWorker:")
+        decorator = source[source.rfind("@app.cls(", 0, pos):pos]
+        end = source.index("def _rembg_load", pos)
+        body = source[pos:end]
+        self.assertIn('gpu="L40S"', decorator)
+        self.assertIn('local_files_only=True', body)
+        self.assertIn('HF_HUB_OFFLINE', body)
+        self.assertIn('delight=False', body)
+        self.assertIn('ip_adapt_scale=0.0', body)
+
+    def test_retexture_validates_geometry_preservation(self):
+        source = RUNTIME.read_text()
+        pos = source.index("class RetextureWorker:")
+        end = source.index("def _rembg_load", pos)
+        body = source[pos:end]
+        self.assertIn('source_geometry_preserved', body)
+        self.assertIn('np.allclose(src_mesh.bounds,objm.bounds', body)
+        self.assertIn('len(src_mesh.faces)==len(objm.faces)', body)
+
+    def test_retexture_endpoint_requires_succeeded_source_and_async_spawn(self):
+        source = RUNTIME.read_text()
+        start = source.index('    async def submit_retexture_job(')
+        end = source.index('    @web.get("/jobs/{job_id}")', start)
+        body = source[start:end]
+        self.assertIn('source_state.get("status") != "succeeded"', body)
+        self.assertIn('await job_states.get.aio(', body)
+        self.assertIn('await job_states.put.aio(', body)
+        self.assertIn('await run_retexture_job.spawn.aio(', body)
+        self.assertNotIn('run_retexture_job.spawn(', body)
+
+
 class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
     class AsyncCall:
         def __init__(self, fn):

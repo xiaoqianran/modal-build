@@ -26,6 +26,23 @@ class RuntimePinsTest(unittest.TestCase):
         self.assertIn("current_revision != TEXT2IMG_MODEL_REVISION", source)
         self.assertIn("local_files_only=True", source)
 
+    def test_retexture_snapshot_is_exactly_pinned(self):
+        self.assertEqual(runtime.RETEXTURE_MODEL_ID, "xinjjj/RoboAssetGen")
+        self.assertRegex(runtime.RETEXTURE_MODEL_REVISION, r"^[0-9a-f]{40}$")
+        source = RUNTIME.read_text()
+        self.assertIn('allow_patterns=["texture_gen_mv_v1/*","super_resolution/*"]', source)
+        self.assertIn("revision=RETEXTURE_MODEL_REVISION", source)
+
+    def test_retexture_lazy_delight_patch_is_active(self):
+        patch = ROOT / "patches" / "embodiedgen-v2.0.0" / "production" / "retexture-lazy-delight.patch"
+        source = RUNTIME.read_text()
+        body = patch.read_text()
+        self.assertTrue(patch.is_file())
+        self.assertIn("retexture-lazy-delight.patch", source)
+        self.assertIn('-from embodied_gen.models.delight_model import DelightingModel', body)
+        self.assertIn('+        from embodied_gen.models.delight_model import DelightingModel', body)
+        self.assertIn('with_mtl=True', source)
+
     def test_release_hashes_are_sha256(self):
         self.assertEqual(
             runtime.RELEASE_WHEELS_SHA256,

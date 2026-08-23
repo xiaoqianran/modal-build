@@ -37,12 +37,19 @@ TEXT2IMG_MODEL_ID = "Kwai-Kolors/Kolors-diffusers"
 TEXT2IMG_MODEL_REVISION = "7e091c75199e910a26cd1b51ed52c28de5db3711"
 TEXT2IMG_MODEL_DIR = "/weights/text2img/kolors-diffusers"
 TEXT2IMG_REVISION_MARKER = ".modal-build-revision"
+RETEXTURE_MODEL_ID = "xinjjj/RoboAssetGen"
+RETEXTURE_MODEL_REVISION = "a64fcdebeea17287d830736cd0853df1093b97ab"
+RETEXTURE_MODEL_DIR = "/weights/retexture/roboassetgen"
+RETEXTURE_REVISION_MARKER = ".modal-build-revision"
+RETEXTURE_CONTROLNET_DIR = f"{RETEXTURE_MODEL_DIR}/texture_gen_mv_v1"
+RETEXTURE_SR_PATH = f"{RETEXTURE_MODEL_DIR}/super_resolution/RealESRGAN_x4plus.pth"
 TEXT2IMG_SCALEDOWN_WINDOWS = {
     "min_cost": 2,
     "cost_first": 30,
     "balanced": 90,
     "burst": 180,
 }
+RETEXTURE_SCALEDOWN_WINDOWS = dict(TEXT2IMG_SCALEDOWN_WINDOWS)
 
 STATIC_AUTOSCALE_PROFILE = "cost_first"
 DEFAULT_REQUEST_PROFILE = "auto"
@@ -68,6 +75,7 @@ RESOURCE_HOURLY_COST = {
     "lite": RATE_L40S_HOUR + 4 * RATE_CPU_CORE_HOUR + 16 * RATE_MEMORY_GIB_HOUR,
     "finalize": 4 * RATE_CPU_CORE_HOUR + 16 * RATE_MEMORY_GIB_HOUR,
     "text2image": RATE_L40S_HOUR + 4 * RATE_CPU_CORE_HOUR + 32 * RATE_MEMORY_GIB_HOUR,
+    "retexture": RATE_L40S_HOUR + 4 * RATE_CPU_CORE_HOUR + 32 * RATE_MEMORY_GIB_HOUR,
 }
 
 
@@ -101,6 +109,18 @@ def text_autoscale_profile_summary(name: str) -> dict:
             image_summary["idle_tail_total_usd"]+text_tail,
             8,
         ),
+    }
+
+
+def retexture_autoscale_profile_summary(name: str) -> dict:
+    if name not in RETEXTURE_SCALEDOWN_WINDOWS:
+        raise ValueError(f"unknown autoscale profile {name!r}; choose {sorted(RETEXTURE_SCALEDOWN_WINDOWS)}")
+    seconds=RETEXTURE_SCALEDOWN_WINDOWS[name]
+    tail=RESOURCE_HOURLY_COST["retexture"] / 3600.0 * seconds
+    return {
+        "profile":name,
+        "scaledown_window_seconds":seconds,
+        "idle_tail_cost_usd":round(tail,8),
     }
 
 
@@ -507,8 +527,13 @@ image = (
 image = (
     image
     .add_local_file("patches/embodiedgen-v2.0.0/production/headless-l40s.patch", "/tmp/headless-l40s.patch", copy=True)
+    .add_local_file(
+        "patches/embodiedgen-v2.0.0/production/retexture-lazy-delight.patch",
+        "/tmp/retexture-lazy-delight.patch",
+        copy=True,
+    )
     .run_commands(
-        "cd /workspace/EmbodiedGen && git apply /tmp/headless-l40s.patch",
+        "cd /workspace/EmbodiedGen && git apply /tmp/headless-l40s.patch && git apply /tmp/retexture-lazy-delight.patch",
         "cd /workspace/EmbodiedGen && grep -RIl '@spaces.GPU' embodied_gen --include='*.py' | xargs -r sed -i '/^[[:space:]]*@spaces.GPU[[:space:]]*$/d'",
         "cd /workspace/EmbodiedGen && python -m pip install --no-deps -e .",
         "cd /workspace/EmbodiedGen && python -m py_compile embodied_gen/scripts/imageto3d.py embodied_gen/data/backproject_v3.py embodied_gen/models/gs_model.py",
@@ -656,6 +681,60 @@ def preload_text2img_weights() -> dict:
     return info
 
 
+@app.function(
+    image=text_weight_image,
+    volumes={"/weights": weights},
+    timeout=30 * 60,
+    cpu=2.0,
+    memory=4096,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=2,
+)
+def preload_retexture_weights() -> dict:
+    """CPU-only pull of pinned ControlNet/SR weights for texture generation."""
+    import shutil
+
+    from huggingface_hub import snapshot_download
+
+    t0=time.perf_counter()
+    target=Path(RETEXTURE_MODEL_DIR)
+    marker=target/RETEXTURE_REVISION_MARKER
+    current=marker.read_text().strip() if marker.exists() else None
+    controlnet=Path(RETEXTURE_CONTROLNET_DIR)/"diffusion_pytorch_model.safetensors"
+    sr=Path(RETEXTURE_SR_PATH)
+    if current != RETEXTURE_MODEL_REVISION or not controlnet.exists() or not sr.exists():
+        if target.exists():
+            shutil.rmtree(target)
+        target.mkdir(parents=True,exist_ok=True)
+        print(
+            f"CPU ONLY: syncing {RETEXTURE_MODEL_ID}@{RETEXTURE_MODEL_REVISION}",
+            flush=True,
+        )
+        snapshot_download(
+            repo_id=RETEXTURE_MODEL_ID,
+            revision=RETEXTURE_MODEL_REVISION,
+            allow_patterns=["texture_gen_mv_v1/*","super_resolution/*"],
+            local_dir=str(target),
+        )
+        marker.write_text(RETEXTURE_MODEL_REVISION+"\n")
+    weights.commit()
+    if marker.read_text().strip() != RETEXTURE_MODEL_REVISION:
+        raise RuntimeError("retexture revision marker mismatch")
+    if not controlnet.exists() or not sr.exists():
+        raise RuntimeError("retexture weights incomplete")
+    info={
+        "model":RETEXTURE_MODEL_ID,
+        "revision":RETEXTURE_MODEL_REVISION,
+        "path":str(target),
+        "size":subprocess.check_output(["du","-sh",str(target)],text=True).split()[0],
+        "seconds":round(time.perf_counter()-t0,3),
+    }
+    print("RETEXTURE_WEIGHTS_READY",json.dumps(info),flush=True)
+    return info
+
+
 @app.cls(
     image=image,
     gpu="L40S",
@@ -749,6 +828,245 @@ class Text2ImageWorker:
         }
         print("TEXT2IMG_OK",json.dumps(out),flush=True)
         return out
+
+
+@app.cls(
+    image=image,
+    gpu="L40S",
+    volumes={"/weights":weights,"/artifacts":artifacts},
+    cpu=4.0,
+    memory=32768,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=RETEXTURE_SCALEDOWN_WINDOWS[STATIC_AUTOSCALE_PROFILE],
+    timeout=30*60,
+)
+class RetextureWorker:
+    """Prompt-driven texture edit for an existing validated asset; geometry stays fixed."""
+
+    @modal.enter()
+    def load(self):
+        import torch
+        from diffusers import KolorsPipeline
+        from kolors.models.controlnet import ControlNetModel
+        from kolors.pipelines.pipeline_controlnet_xl_kolors_img2img import (
+            StableDiffusionXLControlNetImg2ImgPipeline,
+        )
+
+        os.environ["HF_HUB_OFFLINE"]="1"
+        os.environ["TRANSFORMERS_OFFLINE"]="1"
+        base=Path(TEXT2IMG_MODEL_DIR)
+        ret=Path(RETEXTURE_MODEL_DIR)
+        if (base/TEXT2IMG_REVISION_MARKER).read_text().strip() != TEXT2IMG_MODEL_REVISION:
+            raise RuntimeError("Kolors weights/revision mismatch; run preload_text2img_weights first")
+        if (ret/RETEXTURE_REVISION_MARKER).read_text().strip() != RETEXTURE_MODEL_REVISION:
+            raise RuntimeError("retexture weights/revision mismatch; run preload_retexture_weights first")
+        t0=time.perf_counter()
+        base_pipe=KolorsPipeline.from_pretrained(
+            TEXT2IMG_MODEL_DIR,
+            torch_dtype=torch.float16,
+            variant="fp16",
+            local_files_only=True,
+        )
+        controlnet=ControlNetModel.from_pretrained(
+            RETEXTURE_CONTROLNET_DIR,
+            use_safetensors=True,
+            local_files_only=True,
+        ).half()
+        pipe=StableDiffusionXLControlNetImg2ImgPipeline(
+            vae=base_pipe.vae,
+            controlnet=controlnet,
+            text_encoder=base_pipe.text_encoder,
+            tokenizer=base_pipe.tokenizer,
+            unet=base_pipe.unet,
+            scheduler=base_pipe.scheduler,
+            image_encoder=None,
+            feature_extractor=None,
+            force_zeros_for_empty_prompt=False,
+        ).to("cuda")
+        del base_pipe
+        pipe.enable_model_cpu_offload()
+        pipe.enable_xformers_memory_efficient_attention()
+        self.pipe=pipe
+        self.load_seconds=time.perf_counter()-t0
+        print(
+            "RETEXTURE_RESIDENT_READY "+json.dumps({
+                "gpu":torch.cuda.get_device_name(0),
+                "load_seconds":round(self.load_seconds,3),
+                "base_revision":TEXT2IMG_MODEL_REVISION,
+                "controlnet_revision":RETEXTURE_MODEL_REVISION,
+            }),
+            flush=True,
+        )
+
+    @modal.method()
+    def generate(self,job_id: str,source_job_id: str,prompt: str,seed: int=0) -> dict:
+        import shutil
+        import xml.etree.ElementTree as ET
+
+        import numpy as np
+        import trimesh
+        from embodied_gen.data.backproject_v2 import entrypoint as backproject_api
+        from embodied_gen.data.differentiable_render import entrypoint as drender_api
+        from embodied_gen.models.sr_model import ImageRealESRGAN
+        from embodied_gen.scripts.render_mv import infer_pipe as render_mv_api
+
+        prompt=normalize_text_prompt(prompt)
+        if not is_api_job_id(job_id) or not is_api_job_id(source_job_id):
+            raise ValueError("invalid API job id")
+        if job_id == source_job_id:
+            raise ValueError("retexture job must differ from source job")
+        if isinstance(seed,bool) or not isinstance(seed,int) or not 0 <= seed <= 100000:
+            raise ValueError("seed must be an integer in 0..100000")
+
+        artifacts.reload()
+        source_root=api_job_root(source_job_id)
+        source_result=source_root/"result"
+        source_obj=source_result/"mesh"/"sample_00.obj"
+        source_urdf=source_result/"sample_00.urdf"
+        source_gs=source_result/"mesh"/"sample_00_gs.ply"
+        source_gs_aligned=source_result/"mesh"/"sample_00_gs_aligned.ply"
+        for required in (source_obj,source_urdf,source_gs,source_gs_aligned):
+            if not required.is_file():
+                raise FileNotFoundError(f"source asset incomplete: {required}")
+
+        root=api_job_root(job_id)
+        work=root/"retexture"
+        if work.exists():
+            shutil.rmtree(work)
+        condition=work/"condition"
+        multi_view=work/"multi_view"
+        texture_mesh=work/"texture_mesh"
+        preview=work/"preview"
+        texture_mesh.mkdir(parents=True,exist_ok=True)
+        out_obj=texture_mesh/"sample_00.obj"
+        out_glb=texture_mesh/"sample_00.glb"
+
+        total0=time.perf_counter()
+        t0=time.perf_counter()
+        drender_api(
+            mesh_path=str(source_obj),
+            output_root=str(condition),
+            uuid="sample_00",
+            with_mtl=True,
+        )
+        condition_seconds=time.perf_counter()-t0
+
+        t0=time.perf_counter()
+        render_mv_api(
+            index_file=str(condition/"index.json"),
+            controlnet_cond_scale=0.7,
+            guidance_scale=9.0,
+            strength=0.9,
+            num_inference_steps=40,
+            ip_adapt_scale=0.0,
+            ip_img_path=None,
+            prompt=prompt,
+            save_dir=str(multi_view),
+            sub_idxs=[[0,1,2],[3,4,5]],
+            pipeline=self.pipe,
+            seed=seed,
+        )
+        diffusion_seconds=time.perf_counter()-t0
+
+        t0=time.perf_counter()
+        imagesr=ImageRealESRGAN(outscale=4,model_path=RETEXTURE_SR_PATH)
+        backproject_api(
+            delight_model=None,
+            imagesr_model=imagesr,
+            mesh_path=str(source_obj),
+            color_path=str(multi_view/"color_sample0.png"),
+            output_path=str(out_obj),
+            save_glb_path=str(out_glb),
+            skip_fix_mesh=True,
+            delight=False,
+            no_save_delight_img=True,
+            texture_wh=[2048,2048],
+            no_mesh_post_process=True,
+        )
+        backproject_seconds=time.perf_counter()-t0
+
+        t0=time.perf_counter()
+        drender_api(
+            mesh_path=str(out_obj),
+            output_root=str(preview),
+            uuid="sample_00",
+            num_images=90,
+            elevation=[20],
+            with_mtl=True,
+            gen_color_mp4=True,
+            pbr_light_factor=1.2,
+        )
+        preview_seconds=time.perf_counter()-t0
+        preview_mp4=preview/"sample_00"/"color.mp4"
+        if not preview_mp4.is_file():
+            raise FileNotFoundError(f"missing retexture preview: {preview_mp4}")
+
+        result=root/"result"
+        meshdir=result/"mesh"
+        if result.exists():
+            shutil.rmtree(result)
+        meshdir.mkdir(parents=True,exist_ok=True)
+        copy_obj_bundle(out_obj,meshdir)
+        shutil.copy2(out_glb,meshdir/"sample_00.glb")
+        shutil.copy2(source_gs,meshdir/"sample_00_gs.ply")
+        shutil.copy2(source_gs_aligned,meshdir/"sample_00_gs_aligned.ply")
+        shutil.copy2(source_urdf,result/"sample_00.urdf")
+        shutil.copy2(preview_mp4,result/"video.mp4")
+        texture_candidates=[
+            path for path in obj_material_dependencies(out_obj)
+            if path.suffix.lower() in {".png",".jpg",".jpeg",".webp"}
+        ]
+        if texture_candidates:
+            shutil.copy2(texture_candidates[0],meshdir/"texture.png")
+
+        result_obj=meshdir/"sample_00.obj"
+        result_glb=meshdir/"sample_00.glb"
+        src_mesh=trimesh.load(source_obj,force="mesh")
+        objm=trimesh.load(result_obj,force="mesh")
+        glbs=trimesh.load(result_glb,force="scene")
+        ET.parse(result/"sample_00.urdf")
+        with (meshdir/"sample_00_gs.ply").open("rb") as f:
+            header=f.read(8192).decode("ascii","ignore")
+        ply_vertices=next(int(x.split()[-1]) for x in header.splitlines() if x.startswith("element vertex "))
+        geometry_preserved=(
+            len(src_mesh.faces)==len(objm.faces)
+            and np.allclose(src_mesh.bounds,objm.bounds,rtol=1e-5,atol=1e-6)
+        )
+        checks={
+            "ply_vertices":ply_vertices,
+            "obj_vertices":len(objm.vertices),
+            "obj_faces":len(objm.faces),
+            "glb_geometries":len(glbs.geometry),
+            "urdf_mesh_exists":result_obj.exists(),
+            "video_exists":(result/"video.mp4").exists(),
+            "obj_material_missing":missing_obj_material_dependencies(result_obj),
+            "source_geometry_preserved":bool(geometry_preserved),
+            "source_obj_faces":len(src_mesh.faces),
+        }
+        checks["obj_material_refs_ok"]=not checks["obj_material_missing"]
+        if not validation_passes(checks) or not checks["source_geometry_preserved"]:
+            raise RuntimeError(checks)
+        report={
+            "job_id":job_id,
+            "source_job_id":source_job_id,
+            "kind":"retexture",
+            "checks":checks,
+            "timings":{
+                "resident_model_load_seconds":round(self.load_seconds,3),
+                "condition_render_seconds":round(condition_seconds,3),
+                "diffusion_seconds":round(diffusion_seconds,3),
+                "backproject_seconds":round(backproject_seconds,3),
+                "preview_seconds":round(preview_seconds,3),
+                "method_seconds":round(time.perf_counter()-total0,3),
+            },
+        }
+        report["cleaned_intermediates"]=prune_job_intermediates(root)
+        (root/"validation_report.json").write_text(json.dumps(report,indent=2)+"\n")
+        artifacts.commit()
+        print("RETEXTURE_VALIDATION_OK",json.dumps(report),flush=True)
+        return report
 
 
 def _rembg_load(worker, cpu_label: str) -> None:
@@ -1312,6 +1630,55 @@ def _job_update(job_id: str, **changes) -> dict:
     buffer_containers=0,
     scaledown_window=2,
 )
+def run_retexture_job(job_id: str,source_job_id: str,profile: str,prompt: str,seed: int=0) -> dict:
+    if not is_api_job_id(job_id) or not is_api_job_id(source_job_id):
+        raise ValueError("invalid API job id")
+    if profile not in RETEXTURE_SCALEDOWN_WINDOWS:
+        raise ValueError(f"unknown autoscale profile: {profile!r}")
+    prompt=normalize_text_prompt(prompt)
+    worker=RetextureWorker()
+    worker.update_autoscaler(
+        min_containers=0,
+        max_containers=1,
+        buffer_containers=0,
+        scaledown_window=RETEXTURE_SCALEDOWN_WINDOWS[profile],
+    )
+    started=time.perf_counter()
+    try:
+        _job_update(job_id,status="running",stage="retexture")
+        result=worker.generate.remote(job_id,source_job_id,prompt,seed)
+        return _job_update(
+            job_id,
+            status="succeeded",
+            stage="done",
+            profile=profile,
+            stage_seconds={"retexture":round(time.perf_counter()-started,3)},
+            files=sorted(RESULT_FILES),
+            validation=result,
+        )
+    except Exception as exc:
+        _job_update(
+            job_id,
+            status="failed",
+            stage="retexture",
+            profile=profile,
+            stage_seconds={"retexture":round(time.perf_counter()-started,3)},
+            error_type=type(exc).__name__,
+            error=str(exc)[:2000],
+        )
+        raise
+
+
+@app.function(
+    image=control_image,
+    cpu=0.25,
+    memory=512,
+    timeout=60 * 60,
+    min_containers=0,
+    max_containers=8,
+    buffer_containers=0,
+    scaledown_window=2,
+)
 def run_job(job_id: str, profile: str, prompt: str | None=None, text_seed: int=0) -> dict:
     """Cheap orchestrator; optional Text→Image feeds the same validated Image→3D stages."""
     if not is_api_job_id(job_id):
@@ -1421,7 +1788,7 @@ def job_api():
     from fastapi.responses import FileResponse
     from PIL import Image
 
-    web = FastAPI(title="EmbodiedGen Job API", version="1.1")
+    web = FastAPI(title="EmbodiedGen Job API", version="1.2")
 
     @web.get("/health")
     def health():
@@ -1545,6 +1912,74 @@ def job_api():
         await job_states.put.aio(job_id,state)
         try:
             await run_job.spawn.aio(job_id,profile_info["selected_profile"],prompt,seed)
+        except Exception as exc:
+            failed=dict(state)
+            failed.update(
+                status="failed",
+                stage="dispatch",
+                error_type=type(exc).__name__,
+                error=str(exc)[:2000],
+            )
+            stamp=time.time()
+            failed["updated_epoch"]=stamp
+            failed["updated_at"]=datetime.fromtimestamp(stamp,timezone.utc).isoformat()
+            await job_states.put.aio(job_id,failed)
+            raise HTTPException(status_code=503,detail="job dispatch failed") from exc
+        return state
+
+    @web.post("/jobs/{source_job_id}/retexture", status_code=202)
+    async def submit_retexture_job(
+        source_job_id: str,
+        payload: dict = Body(..., media_type="application/json"),  # noqa: B008
+        profile: str = DEFAULT_REQUEST_PROFILE,
+    ):
+        if not is_api_job_id(source_job_id):
+            raise HTTPException(status_code=404,detail="source job not found")
+        source_state=await job_states.get.aio(source_job_id)
+        if not source_state or source_state.get("status") != "succeeded":
+            raise HTTPException(status_code=409,detail="source job must be succeeded")
+        if profile != "auto" and profile not in RETEXTURE_SCALEDOWN_WINDOWS:
+            raise HTTPException(status_code=400,detail="unknown autoscale profile")
+        try:
+            prompt=normalize_text_prompt(payload.get("prompt"))
+        except (TypeError,ValueError) as exc:
+            raise HTTPException(status_code=422,detail=str(exc)) from exc
+        seed=payload.get("seed",0)
+        if isinstance(seed,bool) or not isinstance(seed,int) or not 0 <= seed <= 100000:
+            raise HTTPException(status_code=422,detail="seed must be an integer in 0..100000")
+
+        profile_info=await select_request_profile_aio(profile)
+        selected=profile_info["selected_profile"]
+        job_id=new_job_id()
+        root=api_job_root(job_id)
+        root.mkdir(parents=True,exist_ok=False)
+        (root/"source_job.txt").write_text(source_job_id+"\n")
+        (root/"retexture_prompt.txt").write_text(prompt+"\n")
+        await artifacts.commit.aio()
+        now=time.time()
+        state={
+            "job_id":job_id,
+            "status":"queued",
+            "stage":"queued",
+            "profile":selected,
+            "requested_profile":profile,
+            "created_epoch":now,
+            "created_at":datetime.fromtimestamp(now,timezone.utc).isoformat(),
+            "updated_epoch":now,
+            "updated_at":datetime.fromtimestamp(now,timezone.utc).isoformat(),
+            "input":{
+                "type":"retexture",
+                "source_job_id":source_job_id,
+                "prompt_chars":len(prompt),
+                "backend":"kolors-texture-controlnet",
+                "seed":seed,
+                "delight":False,
+                "ip_adapter":False,
+            },
+        }
+        await job_states.put.aio(job_id,state)
+        try:
+            await run_retexture_job.spawn.aio(job_id,source_job_id,selected,prompt,seed)
         except Exception as exc:
             failed=dict(state)
             failed.update(
