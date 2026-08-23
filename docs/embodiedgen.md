@@ -20,7 +20,7 @@ and the image asserts that `nvcc` is absent.
 | gsplat | 1.5.3, precompiled O3 SM89 extension |
 | PyTorch3D | 0.7.8 wheel, commit `75ebeeaea0908c5527e7b1e305fbc7681382db47` |
 | nvdiffrast | 0.3.3 wheel, commit `729261d`, precompiled SM89 CUDA plugin |
-| EmbodiedGen | v2.0.0 |
+| EmbodiedGen | v2.0.0, commit `cc3015ca5ccdacf94df3428d9e65f79375982216` |
 
 Release: `embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1`.
 
@@ -32,7 +32,8 @@ Release assets:
 - `*.sha256`: asset checksums.
 
 SAM3D weights, DINOv2, U2Net and generated outputs are intentionally **not** stored in the
-GitHub Release. They live on the persistent Modal Volume `embodiedgen-v2-data`.
+GitHub Release. Weights live on `modal-3d-embodiedgen-weights`; per-job intermediates/results live on
+`modal-3d-artifacts`.
 
 ## Why there are two runtime files
 
@@ -64,6 +65,29 @@ Normal inference should never run `nvcc`. A cache miss in gsplat/nvdiffrast is t
 error rather than silently compiling on an L40S. To rebuild CUDA artifacts, use
 `modal_build/embodiedgen.py` and publish a new release tag.
 
+
+### Reproducible source and release integrity
+
+The production consumer pins mutable Git sources to the exact commits observed in the validated
+image:
+
+- EmbodiedGen: `cc3015ca5ccdacf94df3428d9e65f79375982216` (`v2.0.0`);
+- OpenAI CLIP: `d05afc436d78f1c48dc0dbf8e5980a9d471f35f6`;
+- Kolors: `c59c0aa67587e472de657bc9f4f9c18272c94165`.
+
+The release consumer also source-pins the SHA256 values of the two binary archives and verifies them
+**before** extraction:
+
+```text
+wheels.zip           4168abccbc9a0033825e3ad8b9a9e992795f6449107adf357a4dd4acafec398c
+torch-extensions.zip e5e1991ec465b399d46bca271af46394b054afd9eefdbcdcd8b5329f4c8e5bb3
+```
+
+These hashes were re-downloaded from the GitHub Release and independently verified on 2026-08-23.
+The builder now treats a release tag as immutable: if `REPO@TAG` already exists it fails **before the
+expensive compile steps** and instructs the operator to bump `TAG`. Release upload no longer uses
+`--clobber`.
+
 ## Model/cache preparation
 
 Run once; this function is CPU-only:
@@ -72,34 +96,22 @@ Run once; this function is CPU-only:
 modal run runtime/embodiedgen_v2_l40s.py::preload_weights
 ```
 
-It populates the persistent volume with SAM3D, DINOv2 and U2Net assets.
+It populates the persistent volume with SAM3D, DINOv2 and U2Net assets. The preload function is
+CPU-only and capped at `max_containers=1`, preventing concurrent 13 GB downloads/writes to the same
+weights Volume.
 
 ## Benchmark cold vs warm
 
-Run:
+The historical single-function/subprocess benchmark has been retired from the production consumer.
+Use the split-runtime benchmark instead:
 
 ```bash
-modal run runtime/embodiedgen_v2_l40s.py
+modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile auto
 ```
 
-The local entrypoint calls the same GPU function twice. The first call measures cold dispatch +
-container startup; the second call is issued immediately while `scaledown_window=300`, so Modal can
-reuse the warm container. Each run records:
-
-- client wall-clock time;
-- function start → CUDA ready;
-- precompiled extension load time;
-- SAM3D generation time;
-- post-process time;
-- total function time;
-- validation metadata.
-
-Per-run results are persisted under `/data/benchmarks/<timestamp>-<label>/benchmark.json`.
-
-Note: the current validated architecture intentionally runs SAM3D generation in a child process and
-post-processing in fresh CUDA subprocesses for stability. Therefore a warm container saves container
-startup/import overhead, but it does **not** keep the 13 GB SAM3D pipeline resident between requests.
-A future persistent-model worker can reduce warm latency further.
+It exercises the current resident Rembg/SAM3D/Mesh workers, Dict state handoff, Lite L40S texture
+stage, CPU finalizer, autoscale policy selection and final structural validation. Historical timings
+remain below for comparison, but they are not the current execution architecture.
 
 ## Production split runtime
 

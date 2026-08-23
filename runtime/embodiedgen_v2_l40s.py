@@ -17,6 +17,11 @@ import modal
 TAG = "embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1"
 RELEASE = f"https://github.com/xiaoqianran/modal-build/releases/download/{TAG}"
 APP_NAME = "modal-3d-embodiedgen"
+EMBODIEDGEN_COMMIT = "cc3015ca5ccdacf94df3428d9e65f79375982216"
+CLIP_COMMIT = "d05afc436d78f1c48dc0dbf8e5980a9d471f35f6"
+KOLORS_COMMIT = "c59c0aa67587e472de657bc9f4f9c18272c94165"
+RELEASE_WHEELS_SHA256 = "4168abccbc9a0033825e3ad8b9a9e992795f6449107adf357a4dd4acafec398c"
+RELEASE_EXTENSIONS_SHA256 = "e5e1991ec465b399d46bca271af46394b054afd9eefdbcdcd8b5329f4c8e5bb3"
 SAM3D_STAGE1_STEPS = 16
 SAM3D_STAGE2_STEPS = 16
 TARGET_MESH_FACES = 50_000
@@ -242,7 +247,8 @@ image = (
     )
     .run_commands(
         "! command -v nvcc",  # hard invariant: consumer cannot compile CUDA
-        "git clone --depth 1 --branch v2.0.0 https://github.com/HorizonRobotics/EmbodiedGen.git /workspace/EmbodiedGen",
+        "git init /workspace/EmbodiedGen && cd /workspace/EmbodiedGen && git remote add origin https://github.com/HorizonRobotics/EmbodiedGen.git",
+        f"cd /workspace/EmbodiedGen && git fetch --depth 1 origin {EMBODIEDGEN_COMMIT} && git checkout --detach FETCH_HEAD",
         "cd /workspace/EmbodiedGen && git submodule update --init --recursive --progress thirdparty/sam3d",
         "cd /workspace/EmbodiedGen && git submodule update --init --recursive --depth 1 thirdparty/TRELLIS",
     )
@@ -255,9 +261,9 @@ image = (
     )
     .run_commands(
         "python -m pip install --no-deps 'utils3d@git+https://github.com/EasternJournalist/utils3d.git@9a4eb15'",
-        "python -m pip install --no-deps 'clip@git+https://github.com/openai/CLIP.git'",
+        f"python -m pip install --no-deps 'clip@git+https://github.com/openai/CLIP.git@{CLIP_COMMIT}'",
         "python -m pip install --no-deps 'segment-anything@git+https://github.com/facebookresearch/segment-anything.git@dca509f'",
-        "python -m pip install --no-deps 'kolors@git+https://github.com/HochCC/Kolors.git'",
+        f"python -m pip install --no-deps 'kolors@git+https://github.com/HochCC/Kolors.git@{KOLORS_COMMIT}'",
         "python -m pip install --no-deps 'MoGe@git+https://github.com/microsoft/MoGe.git@a8c3734'",
         "PIP_CONSTRAINT=/tmp/eg-constraints.txt python -m pip install plyfile moderngl glcontext ftfy fvcore iopath",
         "python -m pip install --force-reinstall --no-deps numpy==1.26.4 opencv-python==4.11.0.86 opencv-python-headless==4.11.0.86 'pillow<12'",
@@ -270,6 +276,8 @@ image = (
     .run_commands(
         f"mkdir -p /opt/embodiedgen-release/wheels /root/.cache/torch_extensions && curl -fL '{RELEASE}/{TAG}.wheels.zip' -o /tmp/wheels.zip",
         f"curl -fL '{RELEASE}/{TAG}.torch-extensions.zip' -o /tmp/ext.zip",
+        f"echo '{RELEASE_WHEELS_SHA256}  /tmp/wheels.zip' | sha256sum -c -",
+        f"echo '{RELEASE_EXTENSIONS_SHA256}  /tmp/ext.zip' | sha256sum -c -",
         "unzip -q /tmp/wheels.zip -d /opt/embodiedgen-release/wheels",
         "unzip -q /tmp/ext.zip -d /root/.cache/torch_extensions",
         "python -m pip install --no-deps /opt/embodiedgen-release/wheels/pytorch3d-0.7.8-cp310-cp310-linux_x86_64.whl /opt/embodiedgen-release/wheels/nvdiffrast-0.3.3-py3-none-any.whl",
@@ -360,6 +368,10 @@ def _weights_info() -> dict:
     timeout=60 * 60,
     cpu=4.0,
     memory=16384,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=2,
 )
 def preload_weights():
     """CPU-only model/cache pull for a fresh Modal workspace."""

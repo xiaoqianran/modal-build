@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,7 +15,8 @@ WHEELS = Path("/tmp/wheels")
 CACHE_ROOT = Path("/tmp/torch_extensions")
 
 PINS = {
-    "embodiedgen": "v2.0.0",
+    "embodiedgen": "cc3015ca5ccdacf94df3428d9e65f79375982216",
+    "embodiedgen_tag": "v2.0.0",
     "pytorch3d": "75ebeeaea0908c5527e7b1e305fbc7681382db47",
     "nvdiffrast": "729261d",
     "gsplat": "1.5.3",
@@ -75,7 +75,16 @@ def sha256(path: Path) -> str:
     max_containers=1,
 )
 def build_and_release() -> dict:
-    """Build reusable SM89 artifacts without renting a GPU, then publish a release."""
+    """Build reusable SM89 artifacts without renting a GPU, then publish an immutable release."""
+    exists = subprocess.run(
+        ["gh", "release", "view", TAG, "--repo", REPO], capture_output=True, check=False
+    ).returncode == 0
+    if exists:
+        raise RuntimeError(
+            f"release {REPO}@{TAG} already exists; refusing to overwrite immutable artifacts. "
+            "Bump TAG for a new release."
+        )
+
     WHEELS.mkdir(parents=True, exist_ok=True)
     OUT.mkdir(parents=True, exist_ok=True)
     CACHE_ROOT.mkdir(parents=True, exist_ok=True)
@@ -162,7 +171,8 @@ def build_and_release() -> dict:
 
     manifest = {
         "tag": TAG,
-        "source": "HorizonRobotics/EmbodiedGen@v2.0.0",
+        "source": f"HorizonRobotics/EmbodiedGen@{PINS['embodiedgen']}",
+        "source_tag": PINS["embodiedgen_tag"],
         "python": "3.10",
         "ubuntu": "22.04",
         "cuda": "12.6.3",
@@ -205,18 +215,14 @@ def build_and_release() -> dict:
         f"{sha256(manifest_path)}  {manifest_path.name}\n"
     )
 
-    exists = subprocess.run(
-        ["gh", "release", "view", TAG, "--repo", REPO], capture_output=True, check=False
-    ).returncode == 0
     notes = (
         "EmbodiedGen v2.0.0 build artifacts for Python 3.10 / Torch 2.8.0 / "
         "CUDA 12.6 / L40S SM89. Built CPU-only; end-to-end validated on L40S. "
         "Model weights are intentionally excluded."
     )
-    if not exists:
-        sh(f"gh release create '{TAG}' --repo '{REPO}' --title '{TAG}' --notes {json.dumps(notes)}")
+    sh(f"gh release create '{TAG}' --repo '{REPO}' --title '{TAG}' --notes {json.dumps(notes)}")
     sh(
-        f"gh release upload '{TAG}' --repo '{REPO}' --clobber "
+        f"gh release upload '{TAG}' --repo '{REPO}' "
         f"'{wheel_archive}' '{cache_archive}' '{manifest_path}' '{sha_path}'"
     )
     return manifest
