@@ -156,7 +156,7 @@ The benchmark executes two jobs through the same `Sam3DWorker` class handle. The
 cold dispatch plus model loading; the second is issued within the 90-second keep-warm window and is
 expected to reuse the resident model container.
 
-## Measured split-runtime performance
+## Measured split-runtime performance (pre-50k baseline)
 
 Measured on the fresh Modal workspace `shuhuaqaq` with the sample image and the release-only
 (no-`nvcc`) runtime. These are observed values, not estimates.
@@ -184,8 +184,8 @@ The two SAM3D calls returned the exact same resident `instance_id`, proving that
 `scaledown_window` reused the loaded model. Client wall time fell from 100.882 s cold to 15.893 s
 warm. The warm inference itself also improved from 21.229 s to 10.527 s after CUDA/model warm-up.
 
-The original 884,192-face mesh made direct xatlas unwrap take more than five minutes. The production
-CPU stage now uses PyVista decimation before UV unwrap. On this sample it reduced 884,192 faces to
+The original 884,192-face mesh made direct xatlas unwrap take more than five minutes. This baseline
+CPU stage used PyVista decimation before UV unwrap. On this sample it reduced 884,192 faces to
 88,418 faces in 7.637 s, followed by xatlas in 10.353 s. EmbodiedGen v2's own `backproject_v3`
 defaults to `n_max_faces=50000`, so this ~88k-face validation profile remains more conservative than
 the upstream default while cutting UV latency dramatically.
@@ -245,3 +245,91 @@ full 120-second `scaledown_window` costs about **$0.00264 per traffic burst** (0
 1.864-second rembg method itself costs only about **$0.000041**. The 2-CPU alternative would cost
 about $0.00422 for the same 120-second idle window, ~59.6% more, for only 0.275 s lower measured warm
 client latency.
+
+## Mesh/UV 50k optimization
+
+The production MeshWorker now uses `fast-simplification==0.2.0` and targets exactly 50,000 faces
+before xatlas. The worker is CPU-only, uses 4 physical cores + 8 GiB, `min_containers=0`, and a
+90-second `scaledown_window`.
+
+A/B benchmark on the same persisted 884,192-face SAM3D mesh:
+
+| Variant | Simplify | xatlas | Compute total | Client wall |
+|---|---:|---:|---:|---:|
+| **fast-simplification / 4 CPU** | **0.957 s** | 4.375 s | **5.332 s** | 14.044 s cold function |
+| fast-simplification / 8 CPU | 1.339 s | 4.518 s | 5.857 s | 11.387 s |
+| fast-simplification / 16 CPU | 1.590 s | 6.189 s | 7.779 s | 12.540 s |
+| PyVista / 8 CPU | 7.597 s | 3.083 s | 10.680 s | 16.552 s |
+
+More CPU did not improve xatlas on this workload. Four cores had the best measured compute time and
+lowest resource cost. Compared with the previous 88,418-face PyVista path, the production mesh stage
+changed from about 22.23 seconds to a resident-worker warm client wall of **6.46 seconds**:
+
+- MeshWorker cold method: 7.636 s; cold client wall: 13.368 s.
+- MeshWorker warm method: **6.024 s**; warm client wall: **6.460 s**.
+- Warm simplify: 0.850 s.
+- Warm xatlas: 4.369 s.
+- Cold and warm calls returned the same worker instance id.
+
+The critical path no longer exports the 884k-face raw OBJ and stores the small `bake_mesh.npz`
+uncompressed; the lossless high-poly state remains available in `sample_00_state.pkl`.
+
+The resulting 50k mesh was sent through the real Lite L40S texture stage and CPU finalizer:
+
+- Lite L40S 24-view render: 0.254 s.
+- Lite L40S texture bake: 1.201 s.
+- Lite L40S function total: 4.158 s.
+- CPU finalize + structural validation: 1.508 s.
+- Final OBJ: 32,112 vertices / **50,000 faces**.
+- GLB geometry, URDF mesh reference and preview video all validated.
+- Final result: `VALIDATION_OK`.
+
+At the current workspace rates (CPU $0.04730/core-hour, memory $0.00800/GiB-hour), a 4 CPU + 8 GiB
+MeshWorker costs $0.2532/hour while allocated. A full 90-second idle keep-warm tail is about
+**$0.00633 per traffic burst**. `min_containers=0` means it scales to zero when idle.
+
+## Final production benchmark (50k fast-simplification)
+
+A final end-to-end cold + warm run was executed after all production cleanup, using the release-only
+no-`nvcc` image and the 50,000-face `MeshWorker`. The Modal run exited with code 0 and both jobs
+finished with `VALIDATION_OK`.
+
+Warm request path (client-observed wall time):
+
+| Stage | Warm client wall | Warm function/method |
+|---|---:|---:|
+| RembgWorker (1 CPU / 4 GiB) | **2.225 s** | 1.861 s |
+| Sam3DWorker (resident L40S) | **15.988 s** | 15.307 s |
+| MeshWorker (4 CPU / 8 GiB) | **9.738 s** | 9.269 s |
+| Lite L40S texture stage | **7.730 s** | 7.258 s |
+| CPU finalize + validation | **5.281 s** | 3.421 s |
+| **Sequential warm end-to-end** | **40.962 s** | — |
+
+The warm end-to-end value is the sum of the five sequential client-wall measurements from the final
+production run. It improves the prior ~49-second warm baseline by about **8 seconds (~16%)** while
+also reducing the textured mesh from ~88k to exactly 50k faces.
+
+Important final-run details:
+
+- Rembg cold client wall: 50.058 s; warm: 2.225 s; same resident instance.
+- SAM3D model load on this cold run: 48.039 s.
+- SAM3D cold client wall: 131.253 s; warm: 15.988 s; same resident L40S instance.
+- SAM3D warm inference: 12.172 s.
+- Mesh cold downstream call: 12.338 s client wall; warm: 9.738 s.
+- Mesh warm simplify: 1.188 s; xatlas: 6.736 s.
+- Lite L40S warm render24: 0.031 s; texture bake: 0.915 s.
+- Warm downstream (MeshWorker + Lite L40S + finalize): **22.749 s**.
+
+Final warm job validation:
+
+- 94,852 PLY Gaussians;
+- 32,628 textured OBJ vertices;
+- exactly **50,000 OBJ faces**;
+- one valid GLB geometry;
+- valid URDF mesh reference;
+- generated preview video;
+- `VALIDATION_OK`.
+
+Cold client-wall values include Modal scheduling/container startup and are expected to vary much more
+than warm values. The production keep-warm policy remains intentionally bounded (`min_containers=0`):
+Rembg 120 s, heavy SAM3D 90 s, MeshWorker 90 s, Lite L40S 30 s.

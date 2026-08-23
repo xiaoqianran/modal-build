@@ -61,11 +61,12 @@ image = (
         "python -m pip install --no-deps 'segment-anything@git+https://github.com/facebookresearch/segment-anything.git@dca509f'",
         "python -m pip install --no-deps 'kolors@git+https://github.com/HochCC/Kolors.git'",
         "python -m pip install --no-deps 'MoGe@git+https://github.com/microsoft/MoGe.git@a8c3734'",
-        "python -m pip install plyfile moderngl glcontext ftfy fvcore iopath",
+        "PIP_CONSTRAINT=/tmp/eg-constraints.txt python -m pip install plyfile moderngl glcontext ftfy fvcore iopath",
         "python -m pip install --force-reinstall --no-deps numpy==1.26.4 opencv-python==4.11.0.86 opencv-python-headless==4.11.0.86 'pillow<12'",
         "python -m pip install --no-deps kaolin==0.18.0 -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.8.0_cu126.html",
         "python -m pip install pygltflib warp-lang usd-core ipycanvas ipyevents 'jupyter_client<8' tornado",
         "python -m pip install --no-deps gsplat==1.5.3",
+        "python -m pip install --no-deps fast-simplification==0.2.0",
     )
     # Consume release artifacts: no source builds.
     .run_commands(
@@ -354,83 +355,110 @@ class Sam3DWorker:
         return result
 
 
-@app.function(
+@app.cls(
     image=image,
     volumes={"/artifacts": artifacts},
-    timeout=30 * 60,
-    cpu=8.0,
-    memory=32768,
+    cpu=4.0,
+    memory=8192,
+    min_containers=0,
+    max_containers=1,
+    scaledown_window=90,
+    timeout=15 * 60,
 )
-def cpu_xatlas(job_id: str) -> dict:
-    """Pure CPU: mesh orientation, normalization and xatlas UV unwrap."""
-    import pickle
-    import numpy as np
-    import trimesh
-    import pyvista as pv
-    import xatlas
+class MeshWorker:
+    """Persistent CPU mesh worker: fast-simplification -> 50k -> xatlas."""
 
-    t0=time.perf_counter()
-    artifacts.reload()
-    root=Path("/artifacts/embodiedgen/jobs")/job_id
-    with (root/"sample_00_state.pkl").open("rb") as f: state=pickle.load(f)
-    vertices=np.asarray(state["mesh"]["vertices"],dtype=np.float32)
-    faces=np.asarray(state["mesh"]["faces"],dtype=np.int32)
-    input_vertices,input_faces=len(vertices),len(faces)
+    @modal.enter()
+    def load(self):
+        import uuid
+        t0=time.perf_counter()
+        # Warm imports once per container. The C++ modules stay resident.
+        import numpy  # noqa: F401
+        import fast_simplification  # noqa: F401
+        import xatlas  # noqa: F401
+        self.instance_id=uuid.uuid4().hex
+        self.load_seconds=time.perf_counter()-t0
+        print(
+            f"MESH_RESIDENT_READY instance_id={self.instance_id} "
+            f"load_seconds={self.load_seconds:.3f}",
+            flush=True,
+        )
 
-    mesh_add_rot=np.array([[1,0,0],[0,0,-1],[0,1,0]],dtype=np.float32)
-    rot_matrix=np.array([[0,0,-1],[0,1,0],[1,0,0]],dtype=np.float32)
-    vertices=vertices @ mesh_add_rot
-    vertices=vertices @ rot_matrix
-    raw=trimesh.Trimesh(vertices=vertices,faces=faces,process=False)
-    raw.export(root/"sample_00_raw_mesh.obj")
+    @modal.method()
+    def process(self, job_id: str) -> dict:
+        import pickle
+        import numpy as np
+        import fast_simplification
+        import xatlas
 
-    # UV unwrap cost scales badly with triangle count. EmbodiedGen's own v3 path
-    # defaults to n_max_faces=50k; keep ~10% here (~90k on this sample) as a
-    # quality/speed compromise while staying fully CPU-only.
-    pv_faces=np.hstack([np.full((len(faces),1),3,dtype=np.int64),faces.astype(np.int64)]).ravel()
-    poly=pv.PolyData(vertices,pv_faces)
-    d0=time.perf_counter(); dec=poly.decimate(0.90,progress_bar=False); d1=time.perf_counter()
-    vertices=np.asarray(dec.points,dtype=np.float32)
-    faces=np.asarray(dec.faces,dtype=np.int64).reshape(-1,4)[:,1:].astype(np.int32)
+        t0=time.perf_counter()
+        artifacts.reload()
+        root=Path("/artifacts/embodiedgen/jobs")/job_id
+        with (root/"sample_00_state.pkl").open("rb") as f:
+            state=pickle.load(f)
+        vertices=np.asarray(state["mesh"]["vertices"],dtype=np.float32)
+        faces=np.asarray(state["mesh"]["faces"],dtype=np.int32)
+        input_vertices,input_faces=len(vertices),len(faces)
 
-    bbmin=vertices.min(0); bbmax=vertices.max(0)
-    center=(bbmin+bbmax)*0.5
-    scale=np.float32(2.0/(bbmax-bbmin).max())
-    norm=(vertices-center)*scale
-    x_rot=np.array([[1,0,0],[0,0,1],[0,-1,0]],dtype=np.float32)
-    z_rot=np.array([[0,1,0],[-1,0,0],[0,0,1]],dtype=np.float32)
-    norm=norm @ x_rot
-    norm=norm @ z_rot
+        mesh_add_rot=np.array([[1,0,0],[0,0,-1],[0,1,0]],dtype=np.float32)
+        rot_matrix=np.array([[0,0,-1],[0,1,0],[1,0,0]],dtype=np.float32)
+        vertices=vertices @ mesh_add_rot @ rot_matrix
 
-    x0=time.perf_counter()
-    vmapping,indices,uvs=xatlas.parametrize(norm,faces)
-    x1=time.perf_counter()
-    baked_vertices=norm[vmapping]
-    np.savez_compressed(
-        root/"bake_mesh.npz",
-        vertices=baked_vertices.astype(np.float32),
-        faces=np.asarray(indices,dtype=np.int32),
-        uvs=np.asarray(uvs,dtype=np.float32),
-        scale=np.asarray(scale,dtype=np.float32),
-        center=center.astype(np.float32),
-        x_rot=x_rot,
-        z_rot=z_rot,
-    )
-    artifacts.commit()
-    result={
-        "job_id":job_id,
-        "input_vertices":int(input_vertices),
-        "input_faces":int(input_faces),
-        "dec_vertices":int(len(vertices)),
-        "dec_faces":int(len(faces)),
-        "decimate_seconds":round(d1-d0,3),
-        "uv_vertices":int(len(baked_vertices)),
-        "uv_faces":int(len(indices)),
-        "xatlas_seconds":round(x1-x0,3),
-        "total_seconds":round(time.perf_counter()-t0,3),
-    }
-    print("CPU_XATLAS_OK",json.dumps(result),flush=True)
-    return result
+        # Critical path deliberately does not export the 884k-face raw OBJ.
+        # state.pkl remains the lossless high-poly intermediate if it is needed later.
+        d0=time.perf_counter()
+        vertices,faces=fast_simplification.simplify(
+            vertices,
+            faces,
+            target_count=50000,
+            agg=7.0,
+            preserve_border=False,
+        )
+        d1=time.perf_counter()
+        vertices=np.asarray(vertices,dtype=np.float32)
+        faces=np.asarray(faces,dtype=np.int32)
+
+        bbmin=vertices.min(0); bbmax=vertices.max(0)
+        center=(bbmin+bbmax)*0.5
+        scale=np.float32(2.0/(bbmax-bbmin).max())
+        norm=(vertices-center)*scale
+        x_rot=np.array([[1,0,0],[0,0,1],[0,-1,0]],dtype=np.float32)
+        z_rot=np.array([[0,1,0],[-1,0,0],[0,0,1]],dtype=np.float32)
+        norm=norm @ x_rot @ z_rot
+
+        x0=time.perf_counter()
+        vmapping,indices,uvs=xatlas.parametrize(norm,faces)
+        x1=time.perf_counter()
+        baked_vertices=norm[vmapping]
+
+        # These arrays are only a few MB; compression burns CPU and adds latency.
+        np.savez(
+            root/"bake_mesh.npz",
+            vertices=baked_vertices.astype(np.float32),
+            faces=np.asarray(indices,dtype=np.int32),
+            uvs=np.asarray(uvs,dtype=np.float32),
+            scale=np.asarray(scale,dtype=np.float32),
+            center=center.astype(np.float32),
+            x_rot=x_rot,
+            z_rot=z_rot,
+        )
+        artifacts.commit()
+        result={
+            "job_id":job_id,
+            "instance_id":self.instance_id,
+            "worker_load_seconds":round(self.load_seconds,3),
+            "input_vertices":int(input_vertices),
+            "input_faces":int(input_faces),
+            "dec_vertices":int(len(vertices)),
+            "dec_faces":int(len(faces)),
+            "simplify_seconds":round(d1-d0,3),
+            "uv_vertices":int(len(baked_vertices)),
+            "uv_faces":int(len(indices)),
+            "xatlas_seconds":round(x1-x0,3),
+            "method_seconds":round(time.perf_counter()-t0,3),
+        }
+        print("MESH_PROCESS_OK",json.dumps(result),flush=True)
+        return result
 
 
 @app.function(
@@ -587,12 +615,14 @@ def cpu_finalize(job_id: str) -> dict:
     return report
 
 
+
 @app.local_entrypoint()
 def benchmark_split():
     """Prepare both jobs first, then measure cold→warm resident SAM3D back-to-back."""
     print("WEIGHTS", preload_weights.remote(), flush=True)
     worker = Sam3DWorker()
     rembg_worker = RembgWorker()
+    mesh_worker = MeshWorker()
 
     jobs=[]
     # Prepare both inputs before allocating the heavy GPU. The rembg session stays
@@ -628,7 +658,7 @@ def benchmark_split():
     # worker can naturally idle then scale to zero while xatlas uses CPU only.
     for item in jobs:
         down0=time.perf_counter()
-        x0=time.perf_counter(); xr=cpu_xatlas.remote(item["job_id"]); xwall=time.perf_counter()-x0
+        x0=time.perf_counter(); xr=mesh_worker.process.remote(item["job_id"]); xwall=time.perf_counter()-x0
         b0=time.perf_counter(); br=lite_gpu_bake.remote(item["job_id"]); bwall=time.perf_counter()-b0
         f0=time.perf_counter(); fr=cpu_finalize.remote(item["job_id"]); fwall=time.perf_counter()-f0
         item.update({
