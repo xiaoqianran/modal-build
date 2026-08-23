@@ -283,31 +283,6 @@ image = (
         "python -m pip install --no-deps /opt/embodiedgen-release/wheels/pytorch3d-0.7.8-cp310-cp310-linux_x86_64.whl /opt/embodiedgen-release/wheels/nvdiffrast-0.3.3-py3-none-any.whl",
         "rm -f /tmp/wheels.zip /tmp/ext.zip",
     )
-    # Replace JIT loaders with direct .so loaders. On this image nvcc does not exist,
-    # so a cache miss is a hard failure rather than an accidental expensive compile.
-    .run_commands(
-        "python - <<'PY'\n"
-        "from pathlib import Path\n"
-        "import gsplat.cuda._backend as b\n"
-        "p=Path(b.__file__)\n"
-        "p.write_text('''import importlib.util, pathlib, sys\n"
-        "so=pathlib.Path('/root/.cache/torch_extensions/py310_cu126/gsplat_cuda/gsplat_cuda.so')\n"
-        "if not so.exists(): raise ImportError(f'missing precompiled gsplat extension: {so}')\n"
-        "spec=importlib.util.spec_from_file_location('gsplat_cuda', so)\n"
-        "_C=importlib.util.module_from_spec(spec); sys.modules['gsplat_cuda']=_C; spec.loader.exec_module(_C)\n"
-        "__all__=['_C']\n''')\n"
-        "print('patched gsplat direct loader', p)\n"
-        "PY",
-        "python - <<'PY'\n"
-        "from pathlib import Path\n"
-        "import nvdiffrast.torch.ops as ops\n"
-        "p=Path(ops.__file__); s=p.read_text()\n"
-        "old='''    # Compile and load.\n    source_paths = [os.path.join(os.path.dirname(__file__), fn) for fn in source_files]\n    torch.utils.cpp_extension.load(name=plugin_name, sources=source_paths, extra_cflags=common_opts+cc_opts, extra_cuda_cflags=common_opts+['-lineinfo'], extra_ldflags=ldflags, with_cuda=True, verbose=False)\n\n    # Import, cache, and return the compiled module.\n    _cached_plugin[gl] = importlib.import_module(plugin_name)\n'''\n"
-        "new='''    # Release-consumer runtime: direct-load precompiled CUDA plugin; never JIT compile.\n    if gl:\n        raise RuntimeError('nvdiffrast GL plugin is not shipped in the EmbodiedGen consumer release')\n    import importlib.util, sys\n    so = '/root/.cache/torch_extensions/py310_cu126/nvdiffrast_plugin/nvdiffrast_plugin.so'\n    if not os.path.exists(so):\n        raise ImportError(f'missing precompiled nvdiffrast plugin: {so}')\n    spec = importlib.util.spec_from_file_location(plugin_name, so)\n    module = importlib.util.module_from_spec(spec)\n    sys.modules[plugin_name] = module\n    spec.loader.exec_module(module)\n    _cached_plugin[gl] = module\n'''\n"
-        "if old not in s: raise SystemExit('nvdiffrast compile block not found')\n"
-        "p.write_text(s.replace(old,new,1)); print('patched nvdiffrast direct loader', p)\n"
-        "PY",
-    )
     .workdir("/workspace/EmbodiedGen")
 )
 
@@ -315,19 +290,17 @@ image = (
 image = (
     image
     .add_local_file("patches/embodiedgen-v2.0.0/headless-l40s.patch", "/tmp/headless-l40s.patch", copy=True)
-    .add_local_file("patches/embodiedgen-v2.0.0/modal_postprocess.py", "/workspace/EmbodiedGen/embodied_gen/scripts/modal_postprocess.py", copy=True)
-    .add_local_file("patches/embodiedgen-v2.0.0/inference_sam3d_only.py", "/workspace/EmbodiedGen/embodied_gen/utils/inference.py", copy=True)
     .run_commands(
         "cd /workspace/EmbodiedGen && git apply /tmp/headless-l40s.patch",
         "cd /workspace/EmbodiedGen && grep -RIl '@spaces.GPU' embodied_gen --include='*.py' | xargs -r sed -i '/^[[:space:]]*@spaces.GPU[[:space:]]*$/d'",
         "cd /workspace/EmbodiedGen && python -m pip install --no-deps -e .",
-        "cd /workspace/EmbodiedGen && python -m py_compile embodied_gen/scripts/imageto3d.py embodied_gen/scripts/modal_postprocess.py embodied_gen/utils/inference.py",
+        "cd /workspace/EmbodiedGen && python -m py_compile embodied_gen/scripts/imageto3d.py embodied_gen/data/backproject_v3.py embodied_gen/models/gs_model.py",
         "! command -v nvcc",
     )
 )
 
-# Final hardening: every nvdiffrast.torch import overrides _get_plugin with a
-# release-only loader. This works in the Modal parent process and every child subprocess.
+# Single release-loader implementation: direct-load the validated .so files and
+# leave no torch cpp_extension/JIT fallback in the production consumer.
 image = (
     image
     .add_local_file(
@@ -513,7 +486,10 @@ class Sam3DWorker:
         t0=time.perf_counter()
         os.chdir("/workspace/EmbodiedGen")
         os.environ.update({"TORCH_HOME":"/weights/torch", "U2NET_HOME":"/weights/u2net"})
-        assert subprocess.run(["bash","-lc","command -v nvcc"],capture_output=True,check=False).returncode != 0
+        if subprocess.run(
+            ["bash", "-lc", "command -v nvcc"], capture_output=True, check=False
+        ).returncode == 0:
+            raise RuntimeError("release-consumer invariant violated: nvcc is present")
         import uuid
 
         import torch
