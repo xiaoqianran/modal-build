@@ -20,6 +20,66 @@ APP_NAME = "modal-3d-embodiedgen"
 SAM3D_STAGE1_STEPS = 16
 SAM3D_STAGE2_STEPS = 16
 
+DEFAULT_AUTOSCALE_PROFILE = "cost_first"
+AUTOSCALE_PROFILES = {
+    # Absolute minimum idle cost. Best only for very sparse traffic where a cold
+    # start on nearly every request is acceptable.
+    "min_cost": {"rembg": 2, "sam3d": 2, "mesh": 2, "lite": 2},
+    # Production default: preserve a short burst-reuse window without paying for
+    # long idle GPU tails.
+    "cost_first": {"rembg": 60, "sam3d": 30, "mesh": 30, "lite": 10},
+    # Previous latency-oriented baseline.
+    "balanced": {"rembg": 120, "sam3d": 90, "mesh": 90, "lite": 30},
+    # Deliberately expensive; use only during a known traffic burst.
+    "burst": {"rembg": 300, "sam3d": 180, "mesh": 120, "lite": 60},
+}
+
+# Current workspace rates from `modal billing rates` on 2026-08-23.
+RATE_CPU_CORE_HOUR = 0.04730
+RATE_MEMORY_GIB_HOUR = 0.00800
+RATE_L40S_HOUR = 1.95
+RESOURCE_HOURLY_COST = {
+    "rembg": 1 * RATE_CPU_CORE_HOUR + 4 * RATE_MEMORY_GIB_HOUR,
+    "sam3d": RATE_L40S_HOUR + 6 * RATE_CPU_CORE_HOUR + 32 * RATE_MEMORY_GIB_HOUR,
+    "mesh": 4 * RATE_CPU_CORE_HOUR + 8 * RATE_MEMORY_GIB_HOUR,
+    "lite": RATE_L40S_HOUR + 4 * RATE_CPU_CORE_HOUR + 16 * RATE_MEMORY_GIB_HOUR,
+}
+
+
+def autoscale_profile_summary(name: str) -> dict:
+    if name not in AUTOSCALE_PROFILES:
+        raise ValueError(f"unknown autoscale profile {name!r}; choose {sorted(AUTOSCALE_PROFILES)}")
+    windows = AUTOSCALE_PROFILES[name]
+    idle_tail = {
+        stage: RESOURCE_HOURLY_COST[stage] / 3600.0 * seconds
+        for stage, seconds in windows.items()
+    }
+    return {
+        "profile": name,
+        "scaledown_window_seconds": dict(windows),
+        "idle_tail_cost_usd": {k: round(v, 8) for k, v in idle_tail.items()},
+        "idle_tail_total_usd": round(sum(idle_tail.values()), 8),
+    }
+
+
+def runtime_handles(profile: str):
+    """Return one autoscaling pool per stage for a traffic regime.
+
+    Do not flip profiles per request: Modal dynamic options intentionally create
+    independent container pools. Pick one profile for the current traffic regime.
+    """
+    cfg = AUTOSCALE_PROFILES.get(profile)
+    if cfg is None:
+        raise ValueError(f"unknown autoscale profile {profile!r}; choose {sorted(AUTOSCALE_PROFILES)}")
+    if profile == DEFAULT_AUTOSCALE_PROFILE:
+        return RembgWorker(), Sam3DWorker(), MeshWorker(), lite_gpu_bake
+    return (
+        RembgWorker.with_options(scaledown_window=cfg["rembg"])(),
+        Sam3DWorker.with_options(scaledown_window=cfg["sam3d"])(),
+        MeshWorker.with_options(scaledown_window=cfg["mesh"])(),
+        lite_gpu_bake.with_options(scaledown_window=cfg["lite"], max_containers=1, buffer_containers=0),
+    )
+
 app = modal.App(APP_NAME)
 weights = modal.Volume.from_name("modal-3d-embodiedgen-weights", create_if_missing=True)
 artifacts = modal.Volume.from_name("modal-3d-artifacts", create_if_missing=True)
@@ -269,11 +329,12 @@ def _rembg_prepare(worker, job_id: str) -> dict:
     memory=4096,
     min_containers=0,
     max_containers=1,
-    scaledown_window=120,
+    buffer_containers=0,
+    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["rembg"],
     timeout=10 * 60,
 )
 class RembgWorker:
-    """Production rembg worker: 1 CPU + 4 GiB, warm for 120 seconds."""
+    """Production rembg worker: 1 CPU + 4 GiB; static default is COST_FIRST."""
 
     @modal.enter()
     def load(self):
@@ -292,11 +353,12 @@ class RembgWorker:
     memory=32768,
     min_containers=0,
     max_containers=1,
-    scaledown_window=90,
+    buffer_containers=0,
+    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["sam3d"],
     timeout=30 * 60,
 )
 class Sam3DWorker:
-    """Heavy L40S worker: keep the 13GB SAM3D pipeline resident for 90s."""
+    """Heavy L40S worker: resident SAM3D; static default is COST_FIRST."""
 
     @modal.enter()
     def load(self):
@@ -382,7 +444,8 @@ class Sam3DWorker:
     memory=8192,
     min_containers=0,
     max_containers=1,
-    scaledown_window=90,
+    buffer_containers=0,
+    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["mesh"],
     timeout=15 * 60,
 )
 class MeshWorker:
@@ -566,7 +629,9 @@ class MeshWorker:
     cpu=4.0,
     memory=16384,
     min_containers=0,
-    scaledown_window=30,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["lite"],
 )
 def lite_gpu_bake(job_id: str) -> dict:
     """Light L40S: gsplat multiview render + texture bake; no SAM3D model."""
@@ -714,16 +779,16 @@ def cpu_finalize(job_id: str) -> dict:
 
 
 @app.local_entrypoint()
-def benchmark_split():
-    """Prepare both jobs first, then measure cold→warm resident SAM3D back-to-back."""
+def benchmark_split(profile: str = DEFAULT_AUTOSCALE_PROFILE):
+    """Prepare both jobs first, then run the selected cost/latency traffic profile."""
+    profile_info=autoscale_profile_summary(profile)
+    print("AUTOSCALE_PROFILE",json.dumps(profile_info,ensure_ascii=False,indent=2),flush=True)
     print("WEIGHTS", preload_weights.remote(), flush=True)
-    worker = Sam3DWorker()
-    rembg_worker = RembgWorker()
-    mesh_worker = MeshWorker()
+    rembg_worker, worker, mesh_worker, lite_worker = runtime_handles(profile)
 
     jobs=[]
-    # Prepare both inputs before allocating the heavy GPU. The rembg session stays
-    # resident for 120s, so the second input reuses the same U2Net/ONNX session.
+    # Prepare both inputs before allocating the heavy GPU. Calls are back-to-back,
+    # so even COST_FIRST normally reuses the same U2Net/ONNX session.
     for label in ("cold","warm"):
         job_id=f"bench-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{label}"
         p0=time.perf_counter(); prep=rembg_worker.prepare.remote(job_id); pwall=time.perf_counter()-p0
@@ -756,7 +821,7 @@ def benchmark_split():
     for item in jobs:
         down0=time.perf_counter()
         x0=time.perf_counter(); xr=mesh_worker.process.remote(item["job_id"]); xwall=time.perf_counter()-x0
-        b0=time.perf_counter(); br=lite_gpu_bake.remote(item["job_id"]); bwall=time.perf_counter()-b0
+        b0=time.perf_counter(); br=lite_worker.remote(item["job_id"]); bwall=time.perf_counter()-b0
         f0=time.perf_counter(); fr=cpu_finalize.remote(item["job_id"]); fwall=time.perf_counter()-f0
         item.update({
             "xatlas":xr,"xatlas_client_wall":round(xwall,3),

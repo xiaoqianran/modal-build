@@ -117,7 +117,7 @@ Sam3DWorker @app.cls, L40S
   - SAM3D model loaded once in @modal.enter
   - min_containers=0
   - max_containers=1
-  - scaledown_window=90s
+  - default scaledown_window=30s (`cost_first`)
     ↓
 CPU xatlas
   - mesh orientation / normalization
@@ -128,17 +128,18 @@ Lite L40S bake
   - gsplat multiview render
   - nvdiffrast/utils3d texture baking
   - no SAM3D weights loaded
-  - scaledown_window=30s
+  - default scaledown_window=10s (`cost_first`)
     ↓
 CPU finalize
   - OBJ / GLB / fallback URDF
   - structural validation
 ```
 
-This avoids holding an L40S while xatlas unwraps a large mesh. The heavy SAM3D worker remains warm
-for 90 seconds after a request, so bursty requests can reuse the already-loaded 13 GB model without
-forcing a permanent `min_containers=1` GPU. The later texture-bake GPU worker is deliberately light:
-it only loads the precompiled gsplat/nvdiffrast extensions and job artifacts.
+This avoids holding an L40S while xatlas unwraps a large mesh. The current production default is the
+`cost_first` profile: heavy SAM3D remains warm for 30 seconds, while the later texture-bake L40S stays
+warm for only 10 seconds. `min_containers=0`, `buffer_containers=0`, and `max_containers=1` prevent
+permanent or proactive GPU reservations. Longer `balanced`/`burst` profiles remain available when
+traffic is intentionally dense.
 
 Run the CPU-only weight pull in a fresh workspace:
 
@@ -146,15 +147,15 @@ Run the CPU-only weight pull in a fresh workspace:
 modal run runtime/embodiedgen_v2_l40s.py::preload_weights
 ```
 
-Run the split cold/warm benchmark:
+Run the split cold/warm benchmark with the production default:
 
 ```bash
-modal run runtime/embodiedgen_v2_l40s.py
+modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile cost_first
 ```
 
-The benchmark executes two jobs through the same `Sam3DWorker` class handle. The first call measures
-cold dispatch plus model loading; the second is issued within the 90-second keep-warm window and is
-expected to reuse the resident model container.
+The benchmark accepts `min_cost`, `cost_first`, `balanced`, or `burst`. Calls are deliberately issued
+back-to-back so the warm measurement can reuse the same resident class instance even when using the
+shorter `cost_first` window.
 
 ## Measured split-runtime performance (pre-50k baseline)
 
@@ -208,19 +209,9 @@ Final split-run validation succeeded with:
 ## Resident rembg CPU worker
 
 Production rembg uses a resident CPU Class rather than creating a new ONNX/U2Net session for every
-request:
-
-```python
-@app.cls(
-    cpu=1.0,
-    memory=4096,
-    min_containers=0,
-    max_containers=1,
-    scaledown_window=120,
-)
-class RembgWorker:
-    ...
-```
+request. The A/B measurements below were originally taken with a 120-second warm window; the current
+`cost_first` static default is 60 seconds (`min_containers=0`, `buffer_containers=0`,
+`max_containers=1`).
 
 A/B measurement on the `shuhuaqaq` Modal workspace:
 
@@ -240,17 +231,18 @@ At the current workspace rates returned by `modal billing rates` on 2026-08-23:
 - CPU: $0.04730 per physical core-hour.
 - Memory: $0.00800 per GiB-hour.
 
-Therefore 1 CPU + 4 GiB costs $0.07930/hour while the container is allocated. Keeping it idle for the
-full 120-second `scaledown_window` costs about **$0.00264 per traffic burst** (0.264 cents). A warm
-1.864-second rembg method itself costs only about **$0.000041**. The 2-CPU alternative would cost
-about $0.00422 for the same 120-second idle window, ~59.6% more, for only 0.275 s lower measured warm
-client latency.
+Therefore 1 CPU + 4 GiB costs $0.07930/hour while the container is allocated. The historical
+120-second warm window cost about **$0.00264 per traffic burst**; the current 60-second `cost_first`
+window costs about **$0.00132**. A warm 1.864-second rembg method itself costs only about
+**$0.000041**. The 2-CPU alternative was rejected because it cost ~59.6% more for only 0.275 s lower
+measured warm client latency.
 
 ## Mesh/UV 50k optimization
 
-The production MeshWorker now uses `fast-simplification==0.2.0` and targets exactly 50,000 faces
-before xatlas. The worker is CPU-only, uses 4 physical cores + 8 GiB, `min_containers=0`, and a
-90-second `scaledown_window`.
+The production MeshWorker uses `fast-simplification==0.2.0` and targets exactly 50,000 faces before
+xatlas. It is CPU-only, uses 4 physical cores + 8 GiB, and now defaults to the `cost_first` 30-second
+window with `min_containers=0`, `buffer_containers=0`, and `max_containers=1`. The original A/B data
+below used the longer 90-second window.
 
 A/B benchmark on the same persisted 884,192-face SAM3D mesh:
 
@@ -285,8 +277,9 @@ The resulting 50k mesh was sent through the real Lite L40S texture stage and CPU
 - Final result: `VALIDATION_OK`.
 
 At the current workspace rates (CPU $0.04730/core-hour, memory $0.00800/GiB-hour), a 4 CPU + 8 GiB
-MeshWorker costs $0.2532/hour while allocated. A full 90-second idle keep-warm tail is about
-**$0.00633 per traffic burst**. `min_containers=0` means it scales to zero when idle.
+MeshWorker costs $0.2532/hour while allocated. The historical 90-second idle tail was about
+$0.00633; the current 30-second `cost_first` tail is about **$0.00211 per traffic burst**.
+`min_containers=0` means it scales to zero when idle.
 
 ## Final production benchmark (50k fast-simplification)
 
@@ -331,8 +324,9 @@ Final warm job validation:
 - `VALIDATION_OK`.
 
 Cold client-wall values include Modal scheduling/container startup and are expected to vary much more
-than warm values. The production keep-warm policy remains intentionally bounded (`min_containers=0`):
-Rembg 120 s, heavy SAM3D 90 s, MeshWorker 90 s, Lite L40S 30 s.
+than warm values. That benchmark used the former latency-oriented windows: Rembg 120 s, heavy SAM3D
+90 s, MeshWorker 90 s, Lite L40S 30 s. Those values are now preserved as the `balanced` profile rather
+than the production default.
 
 ## SAM3D sampling optimization
 
@@ -517,3 +511,51 @@ Billing snapshot for the final optimization tests on 2026-08-23:
 - Heavy Dict benchmark (one cold + one warm): $0.07150005 L40S + $0.01040601 CPU + $0.00938667 memory = **$0.09129273**.
 - Lite L40S final validation: **$0.00629796** total, including $0.00541682 L40S.
 - The current workspace's cumulative `modal-3d-embodiedgen` R&D/test usage for the day was **$1.80120448**. This includes all earlier failed experiments, profiling, A/B tests and cold starts; it is not a per-image production cost.
+
+## Autoscale cost profiles
+
+Idle keep-warm tails became the largest avoidable GPU cost after state handoff removed Heavy-L40S
+Volume waits. Production therefore uses explicit traffic profiles. All stages retain
+`min_containers=0`; static workers also set `buffer_containers=0` and `max_containers=1`, so idle
+capacity eventually reaches zero and no second GPU container is created accidentally.
+
+Current profiles:
+
+| Profile | Rembg CPU | Heavy L40S | Mesh CPU | Lite L40S | Maximum idle-tail cost / isolated burst |
+|---|---:|---:|---:|---:|---:|
+| `min_cost` | 2 s | 2 s | 2 s | 2 s | **$0.00283** |
+| **`cost_first` (default)** | **60 s** | **30 s** | **30 s** | **10 s** | **$0.03048** |
+| `balanced` | 120 s | 90 s | 90 s | 30 s | $0.09011 |
+| `burst` | 300 s | 180 s | 120 s | 60 s | $0.17733 |
+
+These costs include the full allocated resource set, not only the GPU line item. At the current
+2026-08-23 workspace rates used by the runtime calculator:
+
+- CPU: $0.04730 / physical core-hour;
+- memory: $0.00800 / GiB-hour;
+- L40S: $1.95 / GPU-hour.
+
+Thus the allocated hourly rates of the four warm containers are approximately $0.0793/h for Rembg,
+$2.4898/h for Heavy SAM3D (L40S + 6 CPU + 32 GiB), $0.2532/h for MeshWorker, and $2.2672/h for Lite
+L40S (L40S + 4 CPU + 16 GiB).
+
+`cost_first` cuts the theoretical isolated-burst idle tail from $0.09011 to $0.03048, a reduction of
+about **66.2%** versus the former `balanced` policy. `min_cost` cuts it to about $0.00283, but usually
+forces a cold start on the next non-overlapping request and is intended for extremely sparse traffic.
+The Heavy SAM3D cold model-load penalty has measured roughly 36-48 seconds, so keeping its $2.4898/h
+container warm for 30 seconds costs about $0.02075. In a genuinely sparse workload, `min_cost` wins;
+in a bursty workload, 30 seconds can be cheaper overall if it avoids enough repeated model loads.
+
+Profiles are selected per traffic regime rather than per individual request because Modal
+`with_options()` creates an independent autoscaling pool. The static/default pool is `cost_first`;
+`balanced` and `burst` are temporary overrides for periods where request density justifies the extra
+idle reservation.
+
+Example benchmark selection:
+
+```bash
+modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile cost_first
+modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile balanced
+```
+
+The runtime prints the selected profile and its computed idle-tail cost before any remote work starts.
