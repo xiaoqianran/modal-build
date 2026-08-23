@@ -57,6 +57,12 @@ artifacts and applies runtime compatibility patches in a later image-build stage
 The milestone tag `embodiedgen-v2.0.0-image-to-3d-modal-v1` marks completion of the validated
 Image→3D production pipeline. It is a Git tag only, not a GitHub Release.
 
+The production EmbodiedGen API now also exposes `POST /text-jobs`: a pinned public Kolors
+Text→Image L40S stage generates the conditioning image and then reuses the exact validated
+Image→3D pipeline. A full authenticated production Text→3D E2E has passed with GLB/video/validation
+HTTP downloads and zero traceback/OOM/runtime-warning matches. See `docs/embodiedgen.md` for the
+pinned model revision, timings and measured cold validation cost.
+
 ## TRELLIS2 / L40S
 
 Environment: `hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v1`

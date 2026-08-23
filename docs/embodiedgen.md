@@ -987,3 +987,44 @@ Text2Image worker allocates L40S + 4 CPU + 32 GiB, or about **$2.3952/h** at the
 rates. `min_cost` adds only about **$0.00133067** of Text2Image tail, making the full Text→3D isolated
 idle-tail ceiling about **$0.00433439**. `cost_first` adds about **$0.01996** of Text2Image tail, for a
 combined Text→3D idle-tail ceiling of about **$0.05061400**.
+
+### Production Text→3D E2E
+
+After commit `031b139` was deployed to the production `modal-3d-embodiedgen` app, the authenticated
+`POST /text-jobs?profile=min_cost` endpoint completed a full production Text→3D request as
+`job-b9575d82101c4a0da29e9b0706293233` using the same red-mug prompt and seed 0.
+
+```text
+POST /text-jobs                 202
+Text2Image Kolors               load 16.438 s, generate 14.555 s, 1024×1024
+Rembg CPU                       source=generated-text, remove 1.408 s, method 2.572 s
+SAM3D L40S                      load 40.538 s, inference 17.099 s, method 17.870 s
+Mesh CPU                        714,124 → 50,000 faces, simplify 0.735 s, xatlas 3.799 s
+Lite L40S                       render24 0.261 s, bake 1.195 s, total 8.676 s
+Finalize                        validation 8.397 s
+status                          succeeded
+validation download             HTTP 200
+GLB download                    HTTP 200, 1,875,952 bytes
+video download                  HTTP 200, 56,165 bytes
+```
+
+Final validation reported 76,404 Gaussian vertices, 28,511 OBJ vertices, exactly 50,000 OBJ faces,
+one GLB geometry, valid URDF/video/material references, and successful cleanup of all 14
+intermediate files including `prompt.txt` and the generated input image.
+
+Production logs from request submission through result downloads contained:
+
+```text
+AsyncUsageWarning               0
+NVIDIA CPU-driver warning       0
+Traceback                       0
+OOM / out-of-memory             0
+```
+
+The `20:00 UTC` billing bucket for the production app contained this request and measured
+**$0.15051777** total: `$0.11518248` L40S, `$0.01912945` CPU, and `$0.01620584` memory. This is a cold
+production validation cost rather than a warm steady-state estimate.
+
+Before deployment, the 16.597-GiB Kolors Volume snapshot was also bound to the exact source revision
+with `.modal-build-revision`; both the CPU preload and the paid GPU worker reject a revision mismatch.
+The marker currently matches `7e091c75199e910a26cd1b51ed52c28de5db3711` exactly.
