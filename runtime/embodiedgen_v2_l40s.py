@@ -202,40 +202,82 @@ def preload_weights():
     return info
 
 
-@app.function(
-    image=image,
-    volumes={"/weights": weights, "/artifacts": artifacts},
-    timeout=10 * 60,
-    cpu=4.0,
-    memory=16384,
-)
-def prepare_sample(job_id: str) -> dict:
-    """CPU-only background removal and input staging."""
+def _rembg_load(worker, cpu_label: str) -> None:
+    import uuid
+    import rembg
+
     t0=time.perf_counter()
     os.chdir("/workspace/EmbodiedGen")
     os.environ.update({"U2NET_HOME":"/weights/u2net", "TORCH_HOME":"/weights/torch"})
+    worker.session=rembg.new_session("u2net", providers=["CPUExecutionProvider"])
+    worker.session_load_seconds=time.perf_counter()-t0
+    worker.instance_id=uuid.uuid4().hex
+    worker.cpu_label=cpu_label
+    print(
+        f"REMBG_RESIDENT_READY cpu={cpu_label} instance_id={worker.instance_id} "
+        f"load_seconds={worker.session_load_seconds:.3f}",
+        flush=True,
+    )
+
+
+def _rembg_prepare(worker, job_id: str) -> dict:
     from PIL import Image
     import rembg
 
+    t0=time.perf_counter()
+    artifacts.reload()
     root=Path("/artifacts/embodiedgen/jobs")/job_id
     root.mkdir(parents=True,exist_ok=True)
     src=Path("apps/assets/example_image/sample_00.jpg")
     raw=root/"sample_00_raw.png"
     cond=root/"sample_00_cond.png"
-    image=Image.open(src)
-    image.save(raw)
-    # Equivalent to EmbodiedGen's RembgRemover without importing the very heavy
-    # segment_model module (SAM/Transformers/etc.). Preserve its max-size=1024 rule.
-    current_max=max(image.size)
+    image_in=Image.open(src)
+    image_in.save(raw)
+    current_max=max(image_in.size)
     scale=min(1.0,1024.0/current_max)
     if scale < 1.0:
-        image=image.resize((int(image.width*scale),int(image.height*scale)),Image.Resampling.LANCZOS)
-    session=rembg.new_session("u2net")
-    rembg.remove(image,session=session).save(cond)
+        image_in=image_in.resize(
+            (int(image_in.width*scale),int(image_in.height*scale)),
+            Image.Resampling.LANCZOS,
+        )
+    r0=time.perf_counter()
+    rembg.remove(image_in,session=worker.session).save(cond)
+    r1=time.perf_counter()
     artifacts.commit()
-    out={"job_id":job_id,"raw":str(raw),"cond":str(cond),"seconds":round(time.perf_counter()-t0,3)}
-    print("PREPARE_OK",json.dumps(out),flush=True)
+    out={
+        "job_id":job_id,
+        "raw":str(raw),
+        "cond":str(cond),
+        "cpu":worker.cpu_label,
+        "instance_id":worker.instance_id,
+        "session_load_seconds":round(worker.session_load_seconds,3),
+        "remove_seconds":round(r1-r0,3),
+        "method_seconds":round(time.perf_counter()-t0,3),
+    }
+    print("REMBG_PREPARE_OK",json.dumps(out),flush=True)
     return out
+
+
+@app.cls(
+    image=image,
+    volumes={"/weights": weights, "/artifacts": artifacts},
+    cpu=1.0,
+    memory=4096,
+    min_containers=0,
+    max_containers=1,
+    scaledown_window=120,
+    timeout=10 * 60,
+)
+class RembgWorker:
+    """Production rembg worker: 1 CPU + 4 GiB, warm for 120 seconds."""
+
+    @modal.enter()
+    def load(self):
+        _rembg_load(self,"1cpu-4g")
+
+    @modal.method()
+    def prepare(self, job_id: str) -> dict:
+        return _rembg_prepare(self,job_id)
 
 
 @app.cls(
@@ -550,13 +592,14 @@ def benchmark_split():
     """Prepare both jobs first, then measure cold→warm resident SAM3D back-to-back."""
     print("WEIGHTS", preload_weights.remote(), flush=True)
     worker = Sam3DWorker()
+    rembg_worker = RembgWorker()
 
     jobs=[]
-    # Prepare both inputs before allocating the heavy GPU. This prevents CPU rembg
-    # latency from consuming the 90-second SAM3D keep-warm window.
+    # Prepare both inputs before allocating the heavy GPU. The rembg session stays
+    # resident for 120s, so the second input reuses the same U2Net/ONNX session.
     for label in ("cold","warm"):
         job_id=f"bench-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{label}"
-        p0=time.perf_counter(); prep=prepare_sample.remote(job_id); pwall=time.perf_counter()-p0
+        p0=time.perf_counter(); prep=rembg_worker.prepare.remote(job_id); pwall=time.perf_counter()-p0
         jobs.append({"label":label,"job_id":job_id,"prepare":prep,"prepare_client_wall":round(pwall,3)})
         print(f"PREPARED_{label.upper()}",json.dumps(jobs[-1],ensure_ascii=False,indent=2),flush=True)
 

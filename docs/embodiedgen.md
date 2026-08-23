@@ -204,3 +204,44 @@ Final split-run validation succeeded with:
 - valid URDF mesh reference;
 - generated preview video;
 - `VALIDATION_OK`.
+
+## Resident rembg CPU worker
+
+Production rembg uses a resident CPU Class rather than creating a new ONNX/U2Net session for every
+request:
+
+```python
+@app.cls(
+    cpu=1.0,
+    memory=4096,
+    min_containers=0,
+    max_containers=1,
+    scaledown_window=120,
+)
+class RembgWorker:
+    ...
+```
+
+A/B measurement on the `shuhuaqaq` Modal workspace:
+
+| Config | Session load | remove() | method | client wall | Warm reuse |
+|---|---:|---:|---:|---:|---|
+| 1 CPU + 4 GiB cold | 1.203 s | 1.484 s | 2.091 s | 65.090 s | n/a |
+| **1 CPU + 4 GiB warm** | already resident | 1.302 s | 1.864 s | **2.116 s** | same instance |
+| 2 CPU + 4 GiB cold | 1.134 s | 0.874 s | 1.682 s | 59.064 s | n/a |
+| 2 CPU + 4 GiB warm | already resident | 0.858 s | 1.548 s | 1.841 s | same instance |
+
+The 2-CPU worker saves only 0.275 s of warm client latency, so production keeps the cheaper 1-CPU
+worker. The long cold client-wall values are dominated by Modal container cold start; the actual
+U2Net session initialization itself was only ~1.2 s once the container began executing.
+
+At the current workspace rates returned by `modal billing rates` on 2026-08-23:
+
+- CPU: $0.04730 per physical core-hour.
+- Memory: $0.00800 per GiB-hour.
+
+Therefore 1 CPU + 4 GiB costs $0.07930/hour while the container is allocated. Keeping it idle for the
+full 120-second `scaledown_window` costs about **$0.00264 per traffic burst** (0.264 cents). A warm
+1.864-second rembg method itself costs only about **$0.000041**. The 2-CPU alternative would cost
+about $0.00422 for the same 120-second idle window, ~59.6% more, for only 0.275 s lower measured warm
+client latency.
