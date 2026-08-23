@@ -524,7 +524,7 @@ Current profiles:
 | Profile | Rembg CPU | Heavy L40S | Mesh CPU | Lite L40S | Maximum idle-tail cost / isolated burst |
 |---|---:|---:|---:|---:|---:|
 | `min_cost` | 2 s | 2 s | 2 s | 2 s | **$0.00283** |
-| **`cost_first` (default)** | **60 s** | **30 s** | **30 s** | **10 s** | **$0.03048** |
+| `cost_first` (static fallback) | 60 s | 30 s | 30 s | 10 s | **$0.03048** |
 | `balanced` | 120 s | 90 s | 90 s | 30 s | $0.09011 |
 | `burst` | 300 s | 180 s | 120 s | 60 s | $0.17733 |
 
@@ -546,16 +546,50 @@ The Heavy SAM3D cold model-load penalty has measured roughly 36-48 seconds, so k
 container warm for 30 seconds costs about $0.02075. In a genuinely sparse workload, `min_cost` wins;
 in a bursty workload, 30 seconds can be cheaper overall if it avoids enough repeated model loads.
 
-Profiles are selected per traffic regime rather than per individual request because Modal
-`with_options()` creates an independent autoscaling pool. The static/default pool is `cost_first`;
-`balanced` and `burst` are temporary overrides for periods where request density justifies the extra
-idle reservation.
+The request-level default is now `auto`. AUTO is intentionally conservative and cost-first rather than
+latency-first:
 
-Example benchmark selection:
+- one request seen in the last 60 seconds -> `min_cost`;
+- two or more requests seen in the last 60 seconds -> `cost_first`;
+- `balanced` and `burst` are never selected automatically; they remain explicit operator choices.
+
+Each traffic observation is stored as an independent event in `modal-3d-embodiedgen-traffic`, so
+concurrent request writers do not race on a shared JSON counter/list. Events older than 60 seconds are
+pruned opportunistically on the next request. The classifier itself is a pure function and is covered
+by unit tests, so the event store can later be replaced by Redis/SQL without changing the policy.
+
+Most importantly, AUTO does **not** use `with_options()`. Dynamic options would create independent
+container pools and could turn a warm SAM3D into a needless cold start when a profile changes. The
+runtime now calls `update_autoscaler()` on the same resident Class/function pool and changes only
+`scaledown_window` while keeping `min_containers=0`, `buffer_containers=0`, and `max_containers=1`.
+
+Zero-GPU control-plane validation on 2026-08-23:
+
+```text
+traffic state cleared
+AUTO request #1 -> min_cost   (1 request / 60s, idle-tail ceiling $0.00282750)
+AUTO request #2 -> cost_first (2 requests / 60s, idle-tail ceiling $0.03047778)
+```
+
+The test only hydrated the Modal app and updated autoscaler settings; it did not invoke any model
+worker or allocate L40S compute.
+
+Control/benchmark examples:
 
 ```bash
-modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile cost_first
+# Zero-compute policy check for this app run; it records one synthetic traffic event.
+modal run runtime/embodiedgen_v2_l40s.py::autoscale_policy_check --profile auto
+
+# End-to-end benchmark under automatic policy.
+modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile auto
+
+# Explicit latency-oriented override when an operator knows a dense period is coming.
 modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile balanced
 ```
 
-The runtime prints the selected profile and its computed idle-tail cost before any remote work starts.
+The runtime prints both the requested and selected profile plus its computed idle-tail cost before
+remote model work starts. `autoscale_policy_check` is diagnostic only: a standalone `modal run` ends
+that ephemeral app after the check. Production orchestration must call `select_request_profile()` and
+`apply_autoscale_profile()` in the same app run before dispatching the workers, as `benchmark_split`
+already does. AUTO deliberately caps itself at `cost_first`: the 90/180-second GPU tails buy latency,
+but are not the economical default when the primary requirement is minimum spend.

@@ -20,19 +20,17 @@ APP_NAME = "modal-3d-embodiedgen"
 SAM3D_STAGE1_STEPS = 16
 SAM3D_STAGE2_STEPS = 16
 
-DEFAULT_AUTOSCALE_PROFILE = "cost_first"
+STATIC_AUTOSCALE_PROFILE = "cost_first"
+DEFAULT_REQUEST_PROFILE = "auto"
 AUTOSCALE_PROFILES = {
-    # Absolute minimum idle cost. Best only for very sparse traffic where a cold
-    # start on nearly every request is acceptable.
     "min_cost": {"rembg": 2, "sam3d": 2, "mesh": 2, "lite": 2},
-    # Production default: preserve a short burst-reuse window without paying for
-    # long idle GPU tails.
     "cost_first": {"rembg": 60, "sam3d": 30, "mesh": 30, "lite": 10},
-    # Previous latency-oriented baseline.
     "balanced": {"rembg": 120, "sam3d": 90, "mesh": 90, "lite": 30},
-    # Deliberately expensive; use only during a known traffic burst.
     "burst": {"rembg": 300, "sam3d": 180, "mesh": 120, "lite": 60},
 }
+AUTO_TRAFFIC_WINDOW_SECONDS = 60.0
+AUTO_COST_FIRST_REQUESTS = 2
+TRAFFIC_EVENT_PREFIX = "request:"
 
 # Current workspace rates from `modal billing rates` on 2026-08-23.
 RATE_CPU_CORE_HOUR = 0.04730
@@ -62,28 +60,82 @@ def autoscale_profile_summary(name: str) -> dict:
     }
 
 
-def runtime_handles(profile: str):
-    """Return one autoscaling pool per stage for a traffic regime.
+def auto_profile_for_timestamps(timestamps, now: float) -> tuple[str, int]:
+    """Pure cost-first classifier; BALANCED/BURST are intentionally manual only."""
+    recent = sum(
+        1
+        for timestamp in timestamps
+        if 0.0 <= now - float(timestamp) <= AUTO_TRAFFIC_WINDOW_SECONDS
+    )
+    profile = "cost_first" if recent >= AUTO_COST_FIRST_REQUESTS else "min_cost"
+    return profile, recent
 
-    Do not flip profiles per request: Modal dynamic options intentionally create
-    independent container pools. Pick one profile for the current traffic regime.
+
+def select_request_profile(requested: str = DEFAULT_REQUEST_PROFILE, now: float | None = None) -> dict:
+    """Resolve an explicit profile or record one request and select AUTO cheaply.
+
+    AUTO stores one independent event per request, so concurrent writers cannot overwrite a shared
+    counter/list. Old events are opportunistically deleted on the next request.
     """
+    if requested != "auto":
+        summary = autoscale_profile_summary(requested)
+        return {"requested_profile": requested, "selected_profile": requested, **summary}
+
+    import uuid
+
+    now = time.time() if now is None else float(now)
+    traffic_events.put(f"{TRAFFIC_EVENT_PREFIX}{now:.6f}:{uuid.uuid4().hex}", now)
+    recent_timestamps = []
+    stale_keys = []
+    for key, timestamp in traffic_events.items():
+        if not str(key).startswith(TRAFFIC_EVENT_PREFIX):
+            continue
+        age = now - float(timestamp)
+        if 0.0 <= age <= AUTO_TRAFFIC_WINDOW_SECONDS:
+            recent_timestamps.append(float(timestamp))
+        elif age > AUTO_TRAFFIC_WINDOW_SECONDS:
+            stale_keys.append(key)
+    for key in stale_keys:
+        traffic_events.pop(key, None)
+
+    selected, recent = auto_profile_for_timestamps(recent_timestamps, now)
+    summary = autoscale_profile_summary(selected)
+    return {
+        "requested_profile": "auto",
+        "selected_profile": selected,
+        "recent_requests_60s": recent,
+        "pruned_events": len(stale_keys),
+        **summary,
+    }
+
+
+def runtime_handles():
+    """Return the single shared pool handles used by every autoscale profile."""
+    return RembgWorker(), Sam3DWorker(), MeshWorker(), lite_gpu_bake
+
+
+def apply_autoscale_profile(profile: str, handles=None) -> tuple:
+    """Mutate autoscaler settings on the same pool; never create profile-specific pools."""
     cfg = AUTOSCALE_PROFILES.get(profile)
     if cfg is None:
         raise ValueError(f"unknown autoscale profile {profile!r}; choose {sorted(AUTOSCALE_PROFILES)}")
-    if profile == DEFAULT_AUTOSCALE_PROFILE:
-        return RembgWorker(), Sam3DWorker(), MeshWorker(), lite_gpu_bake
-    return (
-        RembgWorker.with_options(scaledown_window=cfg["rembg"])(),
-        Sam3DWorker.with_options(scaledown_window=cfg["sam3d"])(),
-        MeshWorker.with_options(scaledown_window=cfg["mesh"])(),
-        lite_gpu_bake.with_options(scaledown_window=cfg["lite"], max_containers=1, buffer_containers=0),
-    )
+    rembg_worker, sam_worker, mesh_worker, lite_worker = handles or runtime_handles()
+    common = {"min_containers": 0, "max_containers": 1, "buffer_containers": 0}
+    autoscalers = {
+        "rembg": rembg_worker,
+        "sam3d": sam_worker,
+        "mesh": mesh_worker,
+        "lite": lite_worker,
+    }
+    for stage, target in autoscalers.items():
+        target.update_autoscaler(scaledown_window=cfg[stage], **common)
+    return rembg_worker, sam_worker, mesh_worker, lite_worker
 
 app = modal.App(APP_NAME)
 weights = modal.Volume.from_name("modal-3d-embodiedgen-weights", create_if_missing=True)
 artifacts = modal.Volume.from_name("modal-3d-artifacts", create_if_missing=True)
 state_handoff = modal.Dict.from_name("modal-3d-embodiedgen-state", create_if_missing=True)
+traffic_events = modal.Dict.from_name("modal-3d-embodiedgen-traffic", create_if_missing=True)
 
 ENV = {
     "DEBIAN_FRONTEND": "noninteractive",
@@ -268,6 +320,7 @@ def preload_weights():
 
 def _rembg_load(worker, cpu_label: str) -> None:
     import uuid
+
     import rembg
 
     t0=time.perf_counter()
@@ -285,8 +338,8 @@ def _rembg_load(worker, cpu_label: str) -> None:
 
 
 def _rembg_prepare(worker, job_id: str) -> dict:
-    from PIL import Image
     import rembg
+    from PIL import Image
 
     t0=time.perf_counter()
     artifacts.reload()
@@ -330,7 +383,7 @@ def _rembg_prepare(worker, job_id: str) -> dict:
     min_containers=0,
     max_containers=1,
     buffer_containers=0,
-    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["rembg"],
+    scaledown_window=AUTOSCALE_PROFILES[STATIC_AUTOSCALE_PROFILE]["rembg"],
     timeout=10 * 60,
 )
 class RembgWorker:
@@ -354,7 +407,7 @@ class RembgWorker:
     min_containers=0,
     max_containers=1,
     buffer_containers=0,
-    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["sam3d"],
+    scaledown_window=AUTOSCALE_PROFILES[STATIC_AUTOSCALE_PROFILE]["sam3d"],
     timeout=30 * 60,
 )
 class Sam3DWorker:
@@ -365,10 +418,11 @@ class Sam3DWorker:
         t0=time.perf_counter()
         os.chdir("/workspace/EmbodiedGen")
         os.environ.update({"TORCH_HOME":"/weights/torch", "U2NET_HOME":"/weights/u2net"})
-        assert subprocess.run(["bash","-lc","command -v nvcc"],capture_output=True).returncode != 0
+        assert subprocess.run(["bash","-lc","command -v nvcc"],capture_output=True,check=False).returncode != 0
+        import uuid
+
         import torch
         from embodied_gen.models.sam3d import Sam3dInference
-        import uuid
         self.torch=torch
         self.pipeline=Sam3dInference(local_dir="/weights/sam-3d-objects")
         torch.cuda.synchronize()
@@ -379,9 +433,10 @@ class Sam3DWorker:
     @modal.method()
     def generate(self, job_id: str, seed: int = 0) -> dict:
         import pickle
+
         import numpy as np
-        from PIL import Image
         from embodied_gen.utils.trender import pack_state
+        from PIL import Image
 
         t0=time.perf_counter()
         artifacts.reload()
@@ -445,7 +500,7 @@ class Sam3DWorker:
     min_containers=0,
     max_containers=1,
     buffer_containers=0,
-    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["mesh"],
+    scaledown_window=AUTOSCALE_PROFILES[STATIC_AUTOSCALE_PROFILE]["mesh"],
     timeout=15 * 60,
 )
 class MeshWorker:
@@ -456,8 +511,8 @@ class MeshWorker:
         import uuid
         t0=time.perf_counter()
         # Warm imports once per container. The C++ modules stay resident.
-        import numpy  # noqa: F401
         import fast_simplification  # noqa: F401
+        import numpy  # noqa: F401
         import xatlas  # noqa: F401
         self.instance_id=uuid.uuid4().hex
         self.load_seconds=time.perf_counter()-t0
@@ -470,8 +525,9 @@ class MeshWorker:
     @modal.method()
     def process(self, job_id: str) -> dict:
         import pickle
-        import numpy as np
+
         import fast_simplification
+        import numpy as np
         import xatlas
 
         t0=time.perf_counter()
@@ -533,7 +589,7 @@ class MeshWorker:
             with open(path,"wb") as f:
                 f.write(b"ply\nformat binary_little_endian 1.0\n")
                 f.write(f"element vertex {len(xyz)}\n".encode())
-                for name in fields: f.write(f"property float {name}\n".encode())
+                f.writelines(f"property float {name}\n".encode() for name in fields)
                 f.write(b"end_header\n")
                 out.tofile(f)
 
@@ -609,11 +665,11 @@ class MeshWorker:
             "ply_rebuild_seconds":round(pg1-pg0,3),
             "input_vertices":int(input_vertices),
             "input_faces":int(input_faces),
-            "dec_vertices":int(len(vertices)),
-            "dec_faces":int(len(faces)),
+            "dec_vertices":len(vertices),
+            "dec_faces":len(faces),
             "simplify_seconds":round(d1-d0,3),
-            "uv_vertices":int(len(baked_vertices)),
-            "uv_faces":int(len(indices)),
+            "uv_vertices":len(baked_vertices),
+            "uv_faces":len(indices),
             "xatlas_seconds":round(x1-x0,3),
             "method_seconds":round(time.perf_counter()-t0,3),
         }
@@ -631,19 +687,20 @@ class MeshWorker:
     min_containers=0,
     max_containers=1,
     buffer_containers=0,
-    scaledown_window=AUTOSCALE_PROFILES[DEFAULT_AUTOSCALE_PROFILE]["lite"],
+    scaledown_window=AUTOSCALE_PROFILES[STATIC_AUTOSCALE_PROFILE]["lite"],
 )
 def lite_gpu_bake(job_id: str) -> dict:
     """Light L40S: gsplat multiview render + texture bake; no SAM3D model."""
     import math
+
+    import imageio.v2 as imageio
     import numpy as np
     import torch
-    import imageio.v2 as imageio
-    from PIL import Image
-    from gsplat import rasterization
-    from embodied_gen.data.utils import CameraSetting, init_kal_camera, post_process_texture
     from embodied_gen.data.backproject_v3 import TextureBaker
+    from embodied_gen.data.utils import CameraSetting, init_kal_camera, post_process_texture
     from embodied_gen.models.gs_model import load_gs_model
+    from gsplat import rasterization
+    from PIL import Image
 
     t0=time.perf_counter()
     artifacts.reload()
@@ -715,6 +772,7 @@ def cpu_finalize(job_id: str) -> dict:
     import json as _json
     import shutil
     import xml.etree.ElementTree as ET
+
     import numpy as np
     import trimesh
     from PIL import Image
@@ -762,9 +820,9 @@ def cpu_finalize(job_id: str) -> dict:
     ply_vertices=next(int(x.split()[-1]) for x in header.splitlines() if x.startswith("element vertex "))
     checks={
         "ply_vertices":ply_vertices,
-        "obj_vertices":int(len(objm.vertices)),
-        "obj_faces":int(len(objm.faces)),
-        "glb_geometries":int(len(glbs.geometry)),
+        "obj_vertices":len(objm.vertices),
+        "obj_faces":len(objm.faces),
+        "glb_geometries":len(glbs.geometry),
         "urdf_mesh_exists":(result/"mesh/sample_00.obj").exists(),
         "video_exists":(result/"video.mp4").exists(),
     }
@@ -779,12 +837,23 @@ def cpu_finalize(job_id: str) -> dict:
 
 
 @app.local_entrypoint()
-def benchmark_split(profile: str = DEFAULT_AUTOSCALE_PROFILE):
-    """Prepare both jobs first, then run the selected cost/latency traffic profile."""
-    profile_info=autoscale_profile_summary(profile)
+def autoscale_policy_check(profile: str = DEFAULT_REQUEST_PROFILE):
+    """Validate selection/apply logic in this app run without invoking model workers."""
+    profile_info=select_request_profile(profile)
+    apply_autoscale_profile(profile_info["selected_profile"])
+    print("AUTOSCALE_PROFILE",json.dumps(profile_info,ensure_ascii=False,indent=2),flush=True)
+
+
+@app.local_entrypoint()
+def benchmark_split(profile: str = DEFAULT_REQUEST_PROFILE):
+    """Run cold→warm benchmark under AUTO or an explicit same-pool autoscale profile."""
+    profile_info=select_request_profile(profile)
     print("AUTOSCALE_PROFILE",json.dumps(profile_info,ensure_ascii=False,indent=2),flush=True)
     print("WEIGHTS", preload_weights.remote(), flush=True)
-    rembg_worker, worker, mesh_worker, lite_worker = runtime_handles(profile)
+    handles=runtime_handles()
+    rembg_worker, worker, mesh_worker, lite_worker=apply_autoscale_profile(
+        profile_info["selected_profile"], handles
+    )
 
     jobs=[]
     # Prepare both inputs before allocating the heavy GPU. Calls are back-to-back,
