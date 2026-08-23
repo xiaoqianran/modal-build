@@ -25,6 +25,13 @@ RELEASE_EXTENSIONS_SHA256 = "e5e1991ec465b399d46bca271af46394b054afd9eefdbcdcd8b
 SAM3D_STAGE1_STEPS = 16
 SAM3D_STAGE2_STEPS = 16
 TARGET_MESH_FACES = 50_000
+JOB_ROOT = Path("/artifacts/embodiedgen/jobs")
+API_JOB_PREFIX = "job-"
+MAX_INPUT_BYTES = 20 * 1024 * 1024
+MAX_INPUT_PIXELS = 40_000_000
+API_RESULT_TTL_SECONDS = 7 * 24 * 60 * 60
+API_FAILED_TTL_SECONDS = 24 * 60 * 60
+API_ACTIVE_STALE_SECONDS = 6 * 60 * 60
 
 STATIC_AUTOSCALE_PROFILE = "cost_first"
 DEFAULT_REQUEST_PROFILE = "auto"
@@ -37,6 +44,7 @@ AUTOSCALE_PROFILES = {
 AUTO_TRAFFIC_WINDOW_SECONDS = 60.0
 AUTO_COST_FIRST_REQUESTS = 2
 TRAFFIC_EVENT_PREFIX = "request:"
+_active_autoscale_profile: str | None = None
 
 # Current workspace rates from `modal billing rates` on 2026-08-23.
 RATE_CPU_CORE_HOUR = 0.04730
@@ -114,6 +122,77 @@ def select_request_profile(requested: str = DEFAULT_REQUEST_PROFILE, now: float 
         "pruned_events": len(stale_keys),
         **summary,
     }
+
+
+def new_job_id() -> str:
+    import uuid
+
+    return f"{API_JOB_PREFIX}{uuid.uuid4().hex}"
+
+
+def is_api_job_id(job_id: str) -> bool:
+    import re
+
+    return bool(re.fullmatch(r"job-[0-9a-f]{32}", job_id))
+
+
+def api_job_root(job_id: str) -> Path:
+    if not is_api_job_id(job_id):
+        raise ValueError(f"invalid API job id: {job_id!r}")
+    return JOB_ROOT / job_id
+
+
+def resolve_job_input(job_id: str, root: Path, fallback: Path) -> tuple[Path, str]:
+    """API jobs require an uploaded image; legacy/debug jobs may use the sample fallback."""
+    uploaded = root / "input_image"
+    if is_api_job_id(job_id):
+        if not uploaded.is_file():
+            raise FileNotFoundError(f"missing uploaded image for API job {job_id}")
+        return uploaded, "uploaded"
+    if uploaded.is_file():
+        return uploaded, "uploaded"
+    return fallback, "benchmark-sample"
+
+
+def prune_job_intermediates(root: Path) -> list[str]:
+    """Keep only final deliverables and the validation report."""
+    import shutil
+
+    keep = {"result", "validation_report.json"}
+    removed = []
+    if not root.exists():
+        return removed
+    for path in root.iterdir():
+        if path.name in keep:
+            continue
+        removed.append(path.name)
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink(missing_ok=True)
+    return sorted(removed)
+
+
+def api_job_expired(status: dict | None, *, now: float, fallback_mtime: float) -> bool:
+    updated = float(status.get("updated_epoch", fallback_mtime)) if status else fallback_mtime
+    state = status.get("status") if status else None
+    if state in {"queued", "running"}:
+        return now - updated >= API_ACTIVE_STALE_SECONDS
+    ttl = API_FAILED_TTL_SECONDS if state == "failed" else API_RESULT_TTL_SECONDS
+    return now - updated >= ttl
+
+
+RESULT_FILES = {
+    "glb": "result/mesh/sample_00.glb",
+    "obj": "result/mesh/sample_00.obj",
+    "mtl": "result/mesh/material.mtl",
+    "obj_texture": "result/mesh/material_0.png",
+    "urdf": "result/sample_00.urdf",
+    "video": "result/video.mp4",
+    "gs_ply": "result/mesh/sample_00_gs.ply",
+    "gs_aligned_ply": "result/mesh/sample_00_gs_aligned.ply",
+    "validation": "validation_report.json",
+}
 
 
 def simplify_mesh_if_needed(vertices, faces, simplify_fn, target_faces: int = TARGET_MESH_FACES):
@@ -202,11 +281,17 @@ def runtime_handles():
 
 
 def apply_autoscale_profile(profile: str, handles=None) -> tuple:
-    """Mutate autoscaler settings on the same pool; never create profile-specific pools."""
+    """Update the shared pools only when this control process changes profile."""
+    global _active_autoscale_profile
+
     cfg = AUTOSCALE_PROFILES.get(profile)
     if cfg is None:
         raise ValueError(f"unknown autoscale profile {profile!r}; choose {sorted(AUTOSCALE_PROFILES)}")
-    rembg_worker, sam_worker, mesh_worker, lite_worker, finalizer = handles or runtime_handles()
+    resolved = handles or runtime_handles()
+    if _active_autoscale_profile == profile:
+        return resolved
+
+    rembg_worker, sam_worker, mesh_worker, lite_worker, finalizer = resolved
     common = {"min_containers": 0, "max_containers": 1, "buffer_containers": 0}
     autoscalers = {
         "rembg": rembg_worker,
@@ -217,13 +302,18 @@ def apply_autoscale_profile(profile: str, handles=None) -> tuple:
     }
     for stage, target in autoscalers.items():
         target.update_autoscaler(scaledown_window=cfg[stage], **common)
-    return rembg_worker, sam_worker, mesh_worker, lite_worker, finalizer
+    _active_autoscale_profile = profile
+    return resolved
 
 app = modal.App(APP_NAME)
 weights = modal.Volume.from_name("modal-3d-embodiedgen-weights", create_if_missing=True)
 artifacts = modal.Volume.from_name("modal-3d-artifacts", create_if_missing=True)
 state_handoff = modal.Dict.from_name("modal-3d-embodiedgen-state", create_if_missing=True)
 traffic_events = modal.Dict.from_name("modal-3d-embodiedgen-traffic", create_if_missing=True)
+job_states = modal.Dict.from_name("modal-3d-embodiedgen-jobs", create_if_missing=True)
+control_image = modal.Image.debian_slim(python_version="3.10").pip_install(
+    "fastapi==0.116.1", "pillow==11.3.0"
+)
 
 ENV = {
     "DEBIAN_FRONTEND": "noninteractive",
@@ -413,10 +503,15 @@ def _rembg_prepare(worker, job_id: str) -> dict:
     artifacts.reload()
     root=Path("/artifacts/embodiedgen/jobs")/job_id
     root.mkdir(parents=True,exist_ok=True)
-    src=Path("apps/assets/example_image/sample_00.jpg")
+    src,source=resolve_job_input(
+        job_id,
+        root,
+        Path("apps/assets/example_image/sample_00.jpg"),
+    )
     raw=root/"sample_00_raw.png"
     cond=root/"sample_00_cond.png"
     image_in=Image.open(src)
+    image_in.load()
     image_in.save(raw)
     current_max=max(image_in.size)
     scale=min(1.0,1024.0/current_max)
@@ -433,6 +528,7 @@ def _rembg_prepare(worker, job_id: str) -> dict:
         "job_id":job_id,
         "raw":str(raw),
         "cond":str(cond),
+        "source":source,
         "cpu":worker.cpu_label,
         "instance_id":worker.instance_id,
         "session_load_seconds":round(worker.session_load_seconds,3),
@@ -845,8 +941,8 @@ def lite_gpu_bake(job_id: str) -> dict:
     buffer_containers=0,
     scaledown_window=AUTOSCALE_PROFILES[STATIC_AUTOSCALE_PROFILE]["finalize"],
 )
-def cpu_finalize(job_id: str) -> dict:
-    """Pure CPU: restore mesh scale, export OBJ/GLB, write fallback URDF and validate."""
+def cpu_finalize(job_id: str, cleanup_intermediates: bool = False) -> dict:
+    """Pure CPU: export/validate final assets; optionally prune API intermediates."""
     import json as _json
     import shutil
     import xml.etree.ElementTree as ET
@@ -910,11 +1006,229 @@ def cpu_finalize(job_id: str) -> dict:
     if not validation_passes(checks):
         raise RuntimeError(checks)
     report={"job_id":job_id,"checks":checks,"seconds":round(time.perf_counter()-t0,3)}
+    if cleanup_intermediates:
+        report["cleaned_intermediates"]=prune_job_intermediates(root)
     (root/"validation_report.json").write_text(_json.dumps(report,indent=2)+"\n")
     artifacts.commit()
     print("VALIDATION_OK",_json.dumps(report),flush=True)
     return report
 
+
+
+def _job_update(job_id: str, **changes) -> dict:
+    state = dict(job_states.get(job_id) or {})
+    now = time.time()
+    state.update(changes)
+    state.update(
+        job_id=job_id,
+        updated_epoch=now,
+        updated_at=datetime.fromtimestamp(now, timezone.utc).isoformat(),
+    )
+    job_states.put(job_id, state)
+    return state
+
+
+@app.function(
+    image=control_image,
+    cpu=0.25,
+    memory=512,
+    timeout=60 * 60,
+    min_containers=0,
+    max_containers=8,
+    buffer_containers=0,
+    scaledown_window=2,
+)
+def run_job(job_id: str, profile: str) -> dict:
+    """Cheap orchestrator; expensive stages remain independently autoscaled."""
+    if not is_api_job_id(job_id):
+        raise ValueError(f"invalid API job id: {job_id!r}")
+    if profile not in AUTOSCALE_PROFILES:
+        raise ValueError(f"unknown autoscale profile: {profile!r}")
+    rembg_worker, sam_worker, mesh_worker, lite_worker, finalizer = runtime_handles()
+    stages = (
+        ("rembg", lambda: rembg_worker.prepare.remote(job_id)),
+        ("sam3d", lambda: sam_worker.generate.remote(job_id)),
+        ("mesh", lambda: mesh_worker.process.remote(job_id)),
+        ("texture", lambda: lite_worker.remote(job_id)),
+        ("finalize", lambda: finalizer.remote(job_id, True)),
+    )
+    stage = "dispatch"
+    timings = {}
+    try:
+        for stage, invoke in stages:
+            _job_update(job_id, status="running", stage=stage)
+            started = time.perf_counter()
+            invoke()
+            timings[stage] = round(time.perf_counter() - started, 3)
+        return _job_update(
+            job_id,
+            status="succeeded",
+            stage="done",
+            profile=profile,
+            stage_seconds=timings,
+            files=sorted(RESULT_FILES),
+        )
+    except Exception as exc:
+        _job_update(
+            job_id,
+            status="failed",
+            stage=stage,
+            profile=profile,
+            stage_seconds=timings,
+            error_type=type(exc).__name__,
+            error=str(exc)[:2000],
+        )
+        raise
+
+
+@app.function(
+    image=control_image,
+    volumes={"/artifacts": artifacts},
+    cpu=0.25,
+    memory=512,
+    timeout=10 * 60,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=2,
+    schedule=modal.Period(hours=6),
+)
+def cleanup_stale_api_jobs() -> dict:
+    """Delete stale UUID API jobs only; benchmark/debug directories are untouched."""
+    import shutil
+
+    artifacts.reload()
+    now = time.time()
+    deleted = []
+    if JOB_ROOT.exists():
+        for path in JOB_ROOT.iterdir():
+            if not path.is_dir() or not is_api_job_id(path.name):
+                continue
+            status = job_states.get(path.name)
+            if api_job_expired(status, now=now, fallback_mtime=path.stat().st_mtime):
+                shutil.rmtree(path)
+                job_states.pop(path.name, None)
+                state_handoff.pop(path.name, None)
+                deleted.append(path.name)
+    if deleted:
+        artifacts.commit()
+    result = {"deleted": deleted, "count": len(deleted)}
+    print("API_JOB_CLEANUP", json.dumps(result), flush=True)
+    return result
+
+
+@app.function(
+    image=control_image,
+    volumes={"/artifacts": artifacts},
+    cpu=0.25,
+    memory=512,
+    timeout=5 * 60,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=2,
+)
+@modal.asgi_app(requires_proxy_auth=True)
+def job_api():
+    from io import BytesIO
+
+    from fastapi import Body, FastAPI, HTTPException
+    from fastapi.responses import FileResponse
+    from PIL import Image
+
+    web = FastAPI(title="EmbodiedGen Job API", version="1.0")
+
+    @web.get("/health")
+    def health():
+        return {"ok": True, "app": APP_NAME, "default_profile": DEFAULT_REQUEST_PROFILE}
+
+    @web.post("/jobs", status_code=202)
+    async def submit_job(
+        body: bytes = Body(..., media_type="application/octet-stream"),
+        profile: str = DEFAULT_REQUEST_PROFILE,
+    ):
+        if profile != "auto" and profile not in AUTOSCALE_PROFILES:
+            raise HTTPException(status_code=400, detail="unknown autoscale profile")
+        if not body or len(body) > MAX_INPUT_BYTES:
+            raise HTTPException(status_code=413, detail="image body must be 1..20 MiB")
+        try:
+            with Image.open(BytesIO(body)) as probe:
+                width, height = probe.size
+                fmt = probe.format
+                probe.verify()
+        except Exception as exc:
+            raise HTTPException(status_code=415, detail="invalid image") from exc
+        if width * height > MAX_INPUT_PIXELS:
+            raise HTTPException(status_code=413, detail="image exceeds 40 megapixels")
+
+        job_id = new_job_id()
+        root = api_job_root(job_id)
+        root.mkdir(parents=True, exist_ok=False)
+        (root / "input_image").write_bytes(body)
+        artifacts.commit()
+
+        try:
+            profile_info = select_request_profile(profile)
+            apply_autoscale_profile(profile_info["selected_profile"])
+        except Exception as exc:
+            import shutil
+
+            shutil.rmtree(root, ignore_errors=True)
+            artifacts.commit()
+            raise HTTPException(status_code=503, detail="autoscale setup failed") from exc
+
+        now = time.time()
+        state = {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "profile": profile_info["selected_profile"],
+            "requested_profile": profile,
+            "created_epoch": now,
+            "created_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "updated_epoch": now,
+            "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "input": {"bytes": len(body), "width": width, "height": height, "format": fmt},
+        }
+        job_states.put(job_id, state)
+        try:
+            run_job.spawn(job_id, profile_info["selected_profile"])
+        except Exception as exc:
+            _job_update(
+                job_id,
+                status="failed",
+                stage="dispatch",
+                error_type=type(exc).__name__,
+                error=str(exc)[:2000],
+            )
+            raise HTTPException(status_code=503, detail="job dispatch failed") from exc
+        return state
+
+    @web.get("/jobs/{job_id}")
+    def get_job(job_id: str):
+        if not is_api_job_id(job_id):
+            raise HTTPException(status_code=404, detail="job not found")
+        state = job_states.get(job_id)
+        if not state:
+            raise HTTPException(status_code=404, detail="job not found")
+        state = dict(state)
+        if state.get("status") == "succeeded":
+            state["file_urls"] = {
+                name: f"/jobs/{job_id}/files/{name}" for name in RESULT_FILES
+            }
+        return state
+
+    @web.get("/jobs/{job_id}/files/{name}")
+    def get_file(job_id: str, name: str):
+        if not is_api_job_id(job_id) or name not in RESULT_FILES:
+            raise HTTPException(status_code=404, detail="file not found")
+        artifacts.reload()
+        path = api_job_root(job_id) / RESULT_FILES[name]
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail="file not found")
+        return FileResponse(path, filename=path.name)
+
+    return web
 
 
 @app.local_entrypoint()
@@ -940,7 +1254,9 @@ def benchmark_split(profile: str = DEFAULT_REQUEST_PROFILE):
     # Prepare both inputs before allocating the heavy GPU. Calls are back-to-back,
     # so even COST_FIRST normally reuses the same U2Net/ONNX session.
     for label in ("cold","warm"):
-        job_id=f"bench-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}-{label}"
+        import uuid
+
+        job_id=f"bench-{label}-{uuid.uuid4().hex}"
         p0=time.perf_counter(); prep=rembg_worker.prepare.remote(job_id); pwall=time.perf_counter()-p0
         jobs.append({"label":label,"job_id":job_id,"prepare":prep,"prepare_client_wall":round(pwall,3)})
         print(f"PREPARED_{label.upper()}",json.dumps(jobs[-1],ensure_ascii=False,indent=2),flush=True)

@@ -6,3 +6,5 @@ wheelhouse/
 *.zip
 *.sha256
 .env
+
+.codegraph/

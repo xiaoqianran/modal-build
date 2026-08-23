@@ -661,6 +661,75 @@ sample_00_gs_aligned.ply
 texture.png
 ```
 
-Seventeen local unit tests cover autoscale policy plus the new small-mesh bypass, OBJ material bundle,
+The local test suite covers autoscale policy plus the new small-mesh bypass, OBJ material bundle,
 path-escape rejection, missing-texture detection, and validation negative cases. The real MeshWorker
 and finalizer regression runs were CPU-only; no L40S was allocated for these fixes.
+
+## Minimal authenticated Job API
+
+The production API layer is intentionally small and exists for concrete operational reasons rather
+than abstraction. It provides only four public operations: submit an image, read job status, download
+a named result file, and health-check the service. The heavy 3D stages remain the same independently
+autoscaled workers; the API/orchestrator never embeds SAM3D or texture models.
+
+Deploy with:
+
+```bash
+modal deploy runtime/embodiedgen_v2_l40s.py
+```
+
+`job_api` uses `requires_proxy_auth=True`, so callers must supply their Modal workspace credentials as
+`Modal-Key` and `Modal-Secret` HTTP headers. Do not place those credentials in source control.
+
+### Submit
+
+`POST /jobs?profile=auto` accepts the raw image bytes as the request body and returns HTTP 202 with a
+server-generated id of the form `job-<32 hex>`. The API does not accept a caller-controlled filesystem
+job id. Input is capped at 20 MiB and 40 megapixels and is verified with Pillow before any GPU work is
+dispatched.
+
+An API job **must** contain its uploaded `input_image`. The Rembg stage is forbidden from silently
+falling back to the repository's `sample_00.jpg` for a `job-*` id; that fallback remains available only
+for legacy/debug benchmark ids.
+
+### Status and files
+
+`GET /jobs/{job_id}` returns the persisted state (`queued`, `running`, `succeeded`, or `failed`), current
+stage, selected autoscale profile and measured stage wall times. Successful jobs expose stable named
+file keys. Files are fetched with `GET /jobs/{job_id}/files/{name}`; the server maps those names to a
+fixed allow-list rather than accepting arbitrary paths.
+
+Current file keys are `glb`, `obj`, `mtl`, `obj_texture`, `urdf`, `video`, `gs_ply`,
+`gs_aligned_ply`, and `validation`.
+
+### Cost-first orchestration
+
+`run_job` is a 0.25-CPU / 512-MiB orchestrator that waits on the existing Rembg, Heavy SAM3D,
+MeshWorker, Lite L40S and Finalize stages. It can never allocate GPU itself. This keeps orchestration
+cost negligible while preserving the already-validated per-stage autoscaling and the 20.4-MiB Dict
+handoff out of Heavy L40S.
+
+The authenticated API is capped at one control container. This is deliberate: the in-process
+`_active_autoscale_profile` cache can safely suppress repeated `update_autoscaler()` calls without two
+API containers holding contradictory local views. `run_job` may scale independently because it never
+changes autoscaler policy.
+
+### Artifact retention
+
+Successful API jobs retain only final deliverables plus `validation_report.json`; heavy intermediates
+are removed by the CPU finalizer after validation. A scheduled CPU-only cleanup runs every six hours:
+
+- succeeded/unknown API jobs: 7-day retention;
+- failed jobs: 24-hour retention;
+- queued/running jobs: protected while active, but considered stale after 6 hours so an abruptly lost
+  orchestrator cannot leak storage forever;
+- `bench-*` and other non-API debug directories are never touched by the API TTL sweeper.
+
+A real CPU-only Modal regression seeded a 7-hour-old `running` `job-*` plus a `bench-*` directory. The
+scheduled cleanup deleted the stale API directory and its Dict state while preserving the benchmark
+directory. The app also successfully hydrated the authenticated ASGI endpoint. No L40S was allocated
+for these API/TTL validations.
+
+The API is therefore deliberately not a workflow framework: there is no database server, Redis,
+Celery, custom queue, user-defined DAG or extra GPU service. Modal Dict stores compact job metadata,
+Modal Volume stores artifacts, and the existing workers remain the execution graph.
