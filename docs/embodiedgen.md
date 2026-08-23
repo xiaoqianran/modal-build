@@ -882,3 +882,38 @@ Log scan: no `NVIDIA Driver was not detected` or `GPU functionality will not be 
 The ASGI submit path now uses Modal `.aio()` interfaces for Volume commits, Dict writes, autoscaler
 updates and background dispatch. `autoscale_policy_check` itself runs the same async control path; a
 real Modal control-only run selected `min_cost` and completed with **no `AsyncUsageWarning`**.
+
+#### Final deployed warning-free E2E
+
+After deploying the CPU-image/async-control changes, a fresh authenticated production request used
+`sample_01.jpg` as an uploaded 3024x4032 JPEG (702,567 bytes) with `profile=min_cost`. It completed
+through the real deployed endpoint as `job-495d60ac45014f909c9e7bd4769a7f3f`:
+
+```text
+POST /jobs                  202
+Rembg                       uploaded image, method 6.583 s (remove 1.440 s)
+SAM3D L40S                  load 40.522 s, inference 16.293 s, method 17.358 s
+Mesh CPU                    621,552 -> 50,000 faces, simplify 0.626 s,
+                            xatlas 2.454 s, method 5.840 s
+Lite L40S                   render24 0.240 s, bake 1.225 s, total 4.234 s
+Finalize CPU                8.486 s
+status                      succeeded
+validation download         200
+GLB download                200 (1,851,052 bytes)
+video download              200 (82,212 bytes)
+```
+
+Final validation for this different input returned 62,460 Gaussian PLY vertices, 28,336 OBJ
+vertices, exactly 50,000 OBJ faces, one GLB geometry, valid URDF/video/material references and a
+self-contained result bundle. Thirteen intermediate files were pruned after validation.
+
+Production logs from the request start through all result downloads were scanned explicitly:
+
+```text
+NVIDIA Driver was not detected     0 matches
+AsyncUsageWarning                  0 matches
+Traceback                          0 matches
+```
+
+This closes the earlier two warnings: normal CPU stages no longer use a CUDA base image, and the
+ASGI submit path no longer invokes blocking Modal interfaces from an async context.
