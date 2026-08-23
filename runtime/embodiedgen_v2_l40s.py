@@ -17,10 +17,13 @@ import modal
 TAG = "embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1"
 RELEASE = f"https://github.com/xiaoqianran/modal-build/releases/download/{TAG}"
 APP_NAME = "modal-3d-embodiedgen"
+SAM3D_STAGE1_STEPS = 16
+SAM3D_STAGE2_STEPS = 16
 
 app = modal.App(APP_NAME)
 weights = modal.Volume.from_name("modal-3d-embodiedgen-weights", create_if_missing=True)
 artifacts = modal.Volume.from_name("modal-3d-artifacts", create_if_missing=True)
+state_handoff = modal.Dict.from_name("modal-3d-embodiedgen-state", create_if_missing=True)
 
 ENV = {
     "DEBIAN_FRONTEND": "noninteractive",
@@ -316,7 +319,6 @@ class Sam3DWorker:
         import pickle
         import numpy as np
         from PIL import Image
-        from embodied_gen.models.gs_model import GaussianOperator
         from embodied_gen.utils.trender import pack_state
 
         t0=time.perf_counter()
@@ -326,28 +328,46 @@ class Sam3DWorker:
         if not cond.exists(): raise FileNotFoundError(cond)
         image=Image.open(cond).convert("RGBA")
         i0=time.perf_counter()
-        outputs=self.pipeline.run(image,seed=seed)
+        outputs=self.pipeline.run(
+            image,
+            seed=seed,
+            stage1_inference_steps=SAM3D_STAGE1_STEPS,
+            stage2_inference_steps=SAM3D_STAGE2_STEPS,
+        )
         self.torch.cuda.synchronize()
         i1=time.perf_counter()
         gs=outputs["gaussian"][0]; mesh=outputs["mesh"][0]
-        gs_path=root/"sample_00_gs.ply"
-        gs.save_ply(str(gs_path))
-        rot_matrix=np.array([[0,0,-1],[0,1,0],[1,0,0]])
-        gs_add_rot=np.array([[1,0,0],[0,-1,0],[0,0,-1]])
-        pose=GaussianOperator.trans_to_quatpose(gs_add_rot @ rot_matrix)
-        aligned=root/"sample_00_gs_aligned.ply"
-        GaussianOperator.resave_ply(str(gs_path),str(aligned),instance_pose=pose,device="cpu")
+        p0=time.perf_counter()
         state=pack_state(gs,mesh)
-        with (root/"sample_00_state.pkl").open("wb") as f:
-            pickle.dump(state,f,protocol=pickle.HIGHEST_PROTOCOL)
-        del outputs,gs,mesh,state
+        # Mesh indices are far below int32 limits (~450k vertices). This is lossless
+        # and removes ~10 MiB from every cross-stage state transfer.
+        state["mesh"]["faces"]=state["mesh"]["faces"].astype(np.int32,copy=False)
+        p1=time.perf_counter()
+
+        # Serialize once in-memory, then hand off through Modal Dict. Values above
+        # 2 MiB use Modal's blob transport automatically. This prevents the heavy
+        # L40S from waiting on a Volume commit (observed 1.4-6.3s variance).
+        s0=time.perf_counter()
+        state_payload=pickle.dumps(state,protocol=pickle.HIGHEST_PROTOCOL)
+        s1=time.perf_counter()
+        h0=time.perf_counter()
+        state_handoff.put(job_id,state_payload)
+        h1=time.perf_counter()
+        state_bytes=len(state_payload)
+
+        del outputs,gs,mesh,state,state_payload
         self.torch.cuda.empty_cache()
-        artifacts.commit()
         result={
             "job_id":job_id,
             "instance_id":self.instance_id,
             "resident_model_load_seconds":round(self.load_seconds,3),
+            "stage1_steps":SAM3D_STAGE1_STEPS,
+            "stage2_steps":SAM3D_STAGE2_STEPS,
             "inference_seconds":round(i1-i0,3),
+            "pack_state_seconds":round(p1-p0,3),
+            "serialize_seconds":round(s1-s0,3),
+            "state_handoff_put_seconds":round(h1-h0,3),
+            "state_mib":round(state_bytes/1024/1024,3),
             "method_seconds":round(time.perf_counter()-t0,3),
             "gpu":self.torch.cuda.get_device_name(0),
         }
@@ -394,8 +414,79 @@ class MeshWorker:
         t0=time.perf_counter()
         artifacts.reload()
         root=Path("/artifacts/embodiedgen/jobs")/job_id
-        with (root/"sample_00_state.pkl").open("rb") as f:
-            state=pickle.load(f)
+        root.mkdir(parents=True,exist_ok=True)
+        # The heavy GPU only puts the serialized state into transient Dict storage.
+        # CPU owns durable Volume persistence and all following mesh/PLY work.
+        g0=time.perf_counter(); payload=state_handoff.get(job_id); g1=time.perf_counter()
+        handoff_source="dict"
+        persist0=time.perf_counter()
+        if payload is None:
+            # Retry/debug safety: if CPU already persisted the state in a previous attempt,
+            # reuse it instead of forcing another expensive SAM3D generation.
+            state_path=root/"sample_00_state.pkl"
+            if not state_path.exists():
+                raise RuntimeError(f"missing transient state handoff for {job_id}")
+            payload=state_path.read_bytes()
+            handoff_source="volume-fallback"
+        else:
+            with (root/"sample_00_state.pkl").open("wb") as f:
+                f.write(payload)
+        state=pickle.loads(payload)
+        persist1=time.perf_counter()
+        # Rebuild the raw and aligned Gaussian PLYs entirely on CPU from state.
+        # This reproduces the fields consumed by GaussianOperator.load_from_ply()
+        # without importing torch/gsplat or allocating any GPU.
+        g=state["gaussian"]
+        pg0=time.perf_counter()
+        aabb=np.asarray(g["aabb"],dtype=np.float32)
+        means=np.asarray(g["_xyz"],dtype=np.float32)*aabb[3:]+aabb[:3]
+        fdc=np.asarray(g["_features_dc"],dtype=np.float32).transpose(0,2,1).reshape(len(means),-1)
+        opacity_bias=np.float32(g["opacity_bias"])
+        logit_bias=np.log(opacity_bias/(np.float32(1.0)-opacity_bias)).astype(np.float32)
+        opacities=np.asarray(g["_opacity"],dtype=np.float32).reshape(-1)+logit_bias
+        hidden_scale=np.asarray(g["_scaling"],dtype=np.float32)
+        scale_bias=np.float32(g["scaling_bias"])
+        activation=g["scaling_activation"]
+        if activation == "softplus":
+            inv_bias=scale_bias+np.log(-np.expm1(-scale_bias))
+            active_scale=np.logaddexp(np.float32(0.0),hidden_scale+inv_bias)
+        elif activation == "exp":
+            active_scale=np.exp(hidden_scale+np.log(scale_bias))
+        else:
+            raise RuntimeError(f"unsupported Gaussian scaling activation: {activation}")
+        active_scale=np.sqrt(active_scale*active_scale+np.float32(g["mininum_kernel_size"])**2)
+        log_scales=np.log(active_scale).astype(np.float32)
+        raw_quats=np.asarray(g["_rotation"],dtype=np.float32)+np.asarray([1,0,0,0],dtype=np.float32)
+
+        def write_ply(path, xyz, quats):
+            fields=["x","y","z"]+[f"f_dc_{i}" for i in range(fdc.shape[1])]+["opacity"]+[f"scale_{i}" for i in range(3)]+[f"rot_{i}" for i in range(4)]
+            dtype=np.dtype([(name,"<f4") for name in fields])
+            out=np.empty(len(xyz),dtype=dtype)
+            out["x"],out["y"],out["z"]=xyz[:,0],xyz[:,1],xyz[:,2]
+            for i in range(fdc.shape[1]): out[f"f_dc_{i}"]=fdc[:,i]
+            out["opacity"]=opacities
+            for i in range(3): out[f"scale_{i}"]=log_scales[:,i]
+            for i in range(4): out[f"rot_{i}"]=quats[:,i]
+            with open(path,"wb") as f:
+                f.write(b"ply\nformat binary_little_endian 1.0\n")
+                f.write(f"element vertex {len(xyz)}\n".encode())
+                for name in fields: f.write(f"property float {name}\n".encode())
+                f.write(b"end_header\n")
+                out.tofile(f)
+
+        write_ply(root/"sample_00_gs.ply",means,raw_quats)
+        # Same fixed alignment formerly done by GaussianOperator.resave_ply().
+        align_rot=np.asarray([[0,0,-1],[0,-1,0],[-1,0,0]],dtype=np.float32)
+        aligned_means=means@align_rot.T
+        q=raw_quats/np.linalg.norm(raw_quats,axis=1,keepdims=True)
+        qi=np.asarray([0.0,0.7071067811865476,0.0,-0.7071067811865476],dtype=np.float32)  # wxyz
+        v1=qi[1:]; w1=qi[0]; w2=q[:,0]; v2=q[:,1:]
+        aligned_q=np.empty_like(q)
+        aligned_q[:,0]=w1*w2-np.sum(v2*v1,axis=1)
+        aligned_q[:,1:]=w1*v2+w2[:,None]*v1+np.cross(np.broadcast_to(v1,v2.shape),v2)
+        write_ply(root/"sample_00_gs_aligned.ply",aligned_means,aligned_q)
+        pg1=time.perf_counter()
+
         vertices=np.asarray(state["mesh"]["vertices"],dtype=np.float32)
         faces=np.asarray(state["mesh"]["faces"],dtype=np.int32)
         input_vertices,input_faces=len(vertices),len(faces)
@@ -443,10 +534,16 @@ class MeshWorker:
             z_rot=z_rot,
         )
         artifacts.commit()
+        d0=time.perf_counter(); state_handoff.pop(job_id,None); d1=time.perf_counter()
         result={
             "job_id":job_id,
             "instance_id":self.instance_id,
             "worker_load_seconds":round(self.load_seconds,3),
+            "state_handoff_source":handoff_source,
+            "state_handoff_get_seconds":round(float(g1-g0),3),
+            "state_persist_and_load_seconds":round(float(persist1-persist0),3),
+            "state_handoff_delete_seconds":round(float(d1-d0),3),
+            "ply_rebuild_seconds":round(pg1-pg0,3),
             "input_vertices":int(input_vertices),
             "input_faces":int(input_faces),
             "dec_vertices":int(len(vertices)),

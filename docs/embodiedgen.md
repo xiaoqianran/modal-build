@@ -333,3 +333,187 @@ Final warm job validation:
 Cold client-wall values include Modal scheduling/container startup and are expected to vary much more
 than warm values. The production keep-warm policy remains intentionally bounded (`min_containers=0`):
 Rembg 120 s, heavy SAM3D 90 s, MeshWorker 90 s, Lite L40S 30 s.
+
+## SAM3D sampling optimization
+
+A resident-L40S profiler showed that, after the one-time CUDA/decoder warm-up, the dominant SAM3D
+cost is the two sampling stages rather than mesh/GS decoding or GLB post-processing. On a genuinely
+warm pass:
+
+| SAM3D stage | Time |
+|---|---:|
+| Stage 1 sparse-structure sampling | 3.546 s |
+| Stage 2 sparse-latent sampling | 3.105 s |
+| Mesh decoder | 0.216 s |
+| Gaussian decoder | 0.049 s |
+| Pointmap | 0.064 s |
+| Preprocess | 0.035 s |
+| GLB/postprocess wrapper | 0.021 s |
+| Full warm pipeline | 9.782 s |
+
+The first pass after model load had a one-time ~9.7-second mesh-decoder/kernel warm-up; subsequent
+passes decoded the mesh in ~0.22 seconds.
+
+Sampling A/B on the same resident L40S, same image and seed:
+
+| Schedule | Distillation | Warm SAM3D pipeline | Relative to 25/25 |
+|---|---|---:|---:|
+| 25 / 25 | off | 9.878 s | baseline |
+| 16 / 25 | off | 8.577 s | -13% |
+| 25 / 16 | off | 8.405 s | -15% |
+| **16 / 16** | **off** | **7.289 s** | **-26%** |
+| 8 / 8 | shortcut on | 4.300 s | -56% |
+
+All three full end-to-end candidates (25/25, 16/16, shortcut 8/8) completed the 50k mesh, texture,
+GLB, URDF and video pipeline with `VALIDATION_OK`. The production default is nevertheless **16/16**,
+because its output remains much closer to the 25/25 reference.
+
+Quality comparison against the 25/25 final output:
+
+| Metric | 16/16 | Shortcut 8/8 |
+|---|---:|---:|
+| 60-frame preview PSNR | **31.54 dB** | 21.73 dB |
+| 60-frame preview SSIM | **0.9718** | 0.9119 |
+| Surface Chamfer / baseline bbox diagonal | **0.4595%** | 0.8242% |
+| Surface RMS / baseline bbox diagonal | **0.5101%** | 1.0543% |
+| P95 surface distance / baseline bbox diagonal | **0.8522%** | 2.2219% |
+| P99 surface distance / baseline bbox diagonal | **1.0825%** | 3.6451% |
+
+The 16/16 final mesh remained extremely close in size to baseline (50,000 faces after the common
+MeshWorker step), while shortcut 8/8 changed Gaussian count and overall extent more noticeably.
+Therefore `SAM3D_STAGE1_STEPS=16` and `SAM3D_STAGE2_STEPS=16` are now the production defaults.
+Shortcut 8/8 is documented only as a possible future `turbo` quality/speed mode, not as the default.
+
+## Heavy L40S state handoff optimization
+
+The heavy SAM3D L40S no longer writes PLY files or commits the shared Volume. Profiling showed that
+these operations were expensive and highly variable while holding a $1.95/hour GPU.
+
+State-only Heavy L40S focused warm measurement before replacing Volume commit:
+
+| Operation | Time |
+|---|---:|
+| SAM3D 16/16 inference | 8.319 s |
+| `pack_state` | 0.013 s |
+| local pickle serialization | 0.006 s |
+| copy 20.414 MiB state into Volume mount | 0.027 s |
+| explicit Volume commit | 1.375 s |
+| Heavy method total | 10.006 s |
+| Heavy client wall | 10.247 s |
+
+A later full production run observed the same explicit Volume commit taking **6.339 seconds**, proving
+that commit latency can vary by several seconds. That run still completed with `VALIDATION_OK`, but
+its warm Heavy SAM3D client wall rose to 15.915 s solely because the expensive L40S was waiting for
+storage persistence.
+
+The serialized state was also reduced losslessly from roughly 30.6 MiB to **20.414 MiB** by storing
+mesh face indices as `int32` rather than `int64`; ~450k mesh vertices are far below the int32 index
+limit.
+
+Gaussian PLY generation and alignment were moved to the CPU MeshWorker. Reconstructing both raw and
+aligned PLY files from state took only **0.065 s CPU**. Compared field-by-field with the previous GPU
+path, xyz/features were identical or ~1e-7-level different, scales/quaternions stayed below ~5e-7,
+and opacity differed only at ~2e-5 mean from floating-point inverse-activation arithmetic. The CPU
+PLYs passed the real Lite L40S texture stage and final CPU validation with `VALIDATION_OK`.
+
+### 20.4 MiB cross-stage transport benchmark
+
+The target is to let Heavy L40S stop immediately after inference/packing rather than wait on Volume
+commit. A CPU-only Modal benchmark compared the available handoff mechanisms using a 20.4 MiB
+payload (Modal function arguments/results above 2 MiB automatically use blob storage):
+
+| Transport | Producer/parent blocking time | Consumer/read time |
+|---|---:|---:|
+| direct `spawn(payload)` | 1.60-2.53 s | child became available 0.66-2.67 s later |
+| Function return blob | 2.12-5.67 s client wall | — |
+| **Modal Dict** | **0.43-0.61 s put** | **0.40-0.55 s get** |
+
+`Queue` is not suitable because each Queue item is limited to 1 MiB. `NetworkFileSystem` has immediate
+sharing semantics but is deprecated in the installed Modal SDK and is not used for the production
+baseline.
+
+The billing report for the Dict/transport benchmark contained only ordinary CPU and Memory charges
+(no separate Dict resource line); the complete CPU-only transport experiment cost about $0.00029 CPU
+plus $0.000047 Memory. Dict items expire after seven days of inactivity, but production removes each
+transient state immediately after CPU persistence succeeds.
+
+Production handoff is therefore:
+
+```text
+Heavy L40S
+  SAM3D 16/16
+  -> pack_state
+  -> pickle (~20.4 MiB)
+  -> Dict.put(job_id, state)
+  -> return / release expensive GPU
+
+CPU MeshWorker
+  -> Dict.get(job_id)
+  -> persist state.pkl to Volume
+  -> rebuild raw/aligned PLY (~0.065 s CPU)
+  -> fast-simplification to 50k
+  -> xatlas
+  -> Volume commit (CPU pays the wait)
+  -> Dict.pop(job_id)
+```
+
+At $1.95/hour, removing 1.375-6.339 seconds of Volume-commit wait saves about **$0.00074-$0.00343 of
+L40S time per request**, in addition to improving latency and freeing scarce GPU capacity earlier.
+
+
+### Validated production Dict handoff
+
+The real SAM3D state was then run through the Dict handoff on one resident L40S. The second (warm)
+call measured:
+
+| Heavy L40S operation | Warm time |
+|---|---:|
+| SAM3D 16/16 inference | **9.675 s** |
+| `pack_state` | 0.007 s |
+| pickle serialization | 0.007 s |
+| Dict put (20.414 MiB) | **0.403 s** |
+| Heavy method total | **10.367 s** |
+| Heavy client wall | **10.716 s** |
+
+Cold and warm calls returned the same SAM3D `instance_id`. The Heavy worker therefore spends almost
+all of its warm lifetime doing useful inference, plus roughly 0.4 seconds handing the state to CPU.
+It no longer performs a Volume commit or writes PLY files.
+
+A clean CPU-only Dict-to-MeshWorker run measured:
+
+| CPU MeshWorker operation | Time |
+|---|---:|
+| Dict get | **0.597 s** |
+| persist `state.pkl` + deserialize | 0.041 s |
+| rebuild raw + aligned PLY | 0.056 s |
+| fast-simplification to 50k | 0.437 s |
+| xatlas | 5.501 s |
+| Dict delete | 0.437 s |
+| MeshWorker method total | **8.651 s** |
+
+The CPU worker also has a `volume-fallback` retry path. If a retry occurs after state was already
+persisted but after the transient Dict item was removed, it reuses `sample_00_state.pkl` rather than
+forcing another paid SAM3D run.
+
+The resulting CPU-generated aligned PLY then completed the real Lite L40S stage in **4.215 s**
+(function time; 24-view render 0.184 s, texture bake 1.200 s), followed by CPU finalization in
+**2.200 s**, ending with `VALIDATION_OK` (95,560 PLY Gaussians, 32,517 OBJ vertices, 50,000 OBJ
+faces, valid GLB, URDF mesh reference and preview video).
+
+The previous full warm sequential benchmark was 35.866 s with a 15.915 s Heavy-SAM3D client stage
+that included a 6.339 s Volume commit. Replacing only that measured Heavy stage with the validated
+10.716 s Dict handoff gives a conservative same-shape estimate of roughly **30.7 s warm end-to-end**.
+A new full cold+warm run was intentionally not purchased just to make this number prettier; the
+individual production stages and final artifacts have already been validated, and the next natural
+production request can provide an end-to-end observation at no extra benchmark-only GPU cost.
+
+At $1.95/hour, the measured warm Heavy L40S method (10.367 s) costs about **$0.00562** of active GPU
+time. The measured Lite L40S function (4.215 s) costs about **$0.00228**, so useful active L40S work
+is about **$0.00790 per warm request** before idle keep-warm tails. This makes keep-warm policy, not
+active computation, the next largest GPU-cost lever.
+
+Billing snapshot for the final optimization tests on 2026-08-23:
+
+- Heavy Dict benchmark (one cold + one warm): $0.07150005 L40S + $0.01040601 CPU + $0.00938667 memory = **$0.09129273**.
+- Lite L40S final validation: **$0.00629796** total, including $0.00541682 L40S.
+- The current workspace's cumulative `modal-3d-embodiedgen` R&D/test usage for the day was **$1.80120448**. This includes all earlier failed experiments, profiling, A/B tests and cold starts; it is not a per-image production cost.
