@@ -105,6 +105,21 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn('shutil.copy2(primary_glb, primary_for_evidence)', source)
         self.assertIn('artifact_root=output_root', source)
 
+    def test_segmenter_does_not_depend_on_material_mask_rendering(self):
+        source = RUNTIME.read_text()
+        self.assertNotIn('def _write_segment_mask_obj', source)
+        self.assertNotIn('semantic_mask/mesh_part_mask.obj', source)
+        self.assertNotIn('map_Kd part_', source)
+        self.assertIn('SEGMENT_PALETTE = [', source)
+
+    def test_segmenter_persists_the_exact_mask_palette_for_semantics(self):
+        source = RUNTIME.read_text()
+        self.assertIn('SEGMENT_PALETTE = [', source)
+        self.assertIn('{"name": "Yellow", "rgb": [255, 225, 25]}', source)
+        self.assertIn('{"name": "Blue", "rgb": [0, 130, 200]}', source)
+        self.assertIn('"palette": [', source)
+        self.assertIn('SEGMENT_PALETTE[part_id % len(SEGMENT_PALETTE)]["name"]', source)
+
     def test_segmenter_emits_compiler_native_glb_aligned_evidence(self):
         source = RUNTIME.read_text()
         self.assertIn('def _read_glb_document', source)

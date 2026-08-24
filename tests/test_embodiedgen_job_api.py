@@ -275,6 +275,86 @@ class AffordanceJobTest(unittest.TestCase):
         self.assertIn('ALL_RESULT_FILES[name]', source)
 
 
+class AffordanceSemanticInputTest(unittest.TestCase):
+    def test_semantic_parts_are_bound_to_persisted_provider_palette(self):
+        parts = runtime.semantic_parts_from_segmentation(
+            {
+                "palette": [
+                    {"id": "0", "name": "Red", "rgb": [230, 25, 75]},
+                    {"id": "1", "name": "Green", "rgb": [60, 180, 75]},
+                ]
+            },
+            {"segments": [{"id": "1", "faceCount": 2}, {"id": "0", "faceCount": 3}]},
+        )
+        self.assertEqual(parts, [
+            {"id": "1", "maskColor": "Green", "maskRgb": [60, 180, 75]},
+            {"id": "0", "maskColor": "Red", "maskRgb": [230, 25, 75]},
+        ])
+        with self.assertRaises(ValueError):
+            runtime.semantic_parts_from_segmentation(
+                {"palette": [{"id": "0", "name": "Red", "rgb": [230, 25, 75]}]},
+                {"segments": [{"id": "1", "faceCount": 2}]},
+            )
+
+    def test_semantic_input_renderer_is_isolated_from_gpt_and_hash_binds_outputs(self):
+        source = RUNTIME.read_text()
+        start = source.index("def prepare_affordance_semantic_inputs(")
+        end = source.index("def affordance_runtime_handles", start)
+        body = source[start:end]
+        self.assertIn('gpu="L40S"', source[source.rfind("@app.function", 0, start):start])
+        self.assertIn('from embodied_gen.utils.vis_utils import render_grid', body)
+        self.assertIn('output_subdir="rgb_views"', body)
+        self.assertIn('staging / "mask_views"', body)
+        self.assertIn('render_semantic_face_label_grid(', body)
+        self.assertIn('compiler_segmentation,', body)
+        self.assertIn('semantic_grid_diagnostics(mask_final)', body)
+        self.assertIn('semantic_mask_palette_visibility(mask_final, parts)', body)
+        self.assertIn('render_semantic_part_atlas(', body)
+        self.assertIn('"partAtlas": {', body)
+        self.assertIn('"renderer": "embodiedgen-rgb+nvdiffrast-face-id"', body)
+        self.assertIn('semantic_mask_palette_visibility(mask_final, parts)', body)
+        self.assertIn('"sha256": _sha256_file(rgb_final)', body)
+        self.assertIn('"sha256": _sha256_file(mask_final)', body)
+        self.assertIn('semantic_parts_from_segmentation', body)
+        self.assertIn('AFFORDANCE_SEMANTIC_INPUTS_OK', body)
+        self.assertNotIn('API_KEY', body)
+        self.assertNotIn('MODEL_NAME', body)
+        self.assertNotIn('openai', body.lower())
+
+    def test_semantic_mask_uses_triangle_id_raster_not_materials(self):
+        source = RUNTIME.read_text()
+        start = source.index("def render_semantic_face_label_grid(")
+        end = source.index("def new_job_id", start)
+        body = source[start:end]
+        self.assertIn('rast[..., 3].long() - 1', body)
+        self.assertIn('image[valid] = colors[ids[valid]]', body)
+        self.assertIn('CameraSetting(', body)
+        self.assertIn('elevation=(45.0, -45.0)', body)
+        self.assertIn('distance=5.0', body)
+        self.assertIn('fov=math.radians(30.0)', body)
+        self.assertIn('render_semantic_face_label_grid', source)
+        self.assertNotIn('map_Kd', body)
+        self.assertNotIn('mask_obj', body)
+
+    def test_semantic_part_atlas_isolated_views_cover_hidden_parts(self):
+        source = RUNTIME.read_text()
+        start = source.index("def render_semantic_part_atlas(")
+        end = source.index("def new_job_id", start)
+        body = source[start:end]
+        self.assertIn('views_per_part: int = 3', body)
+        self.assertIn('torch.unique(', body)
+        self.assertIn('normalize_vertices_array(part_vertices)', body)
+        self.assertIn('semantic part atlas cannot render part', body)
+        self.assertIn("part {part_id}  {part['maskColor']}", body)
+
+    def test_semantic_category_is_bounded(self):
+        self.assertEqual(runtime.normalize_semantic_category(" mug "), "mug")
+        with self.assertRaises(ValueError):
+            runtime.normalize_semantic_category("")
+        with self.assertRaises(ValueError):
+            runtime.normalize_semantic_category("x" * 161)
+
+
 class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
     class AsyncCall:
         def __init__(self, fn):

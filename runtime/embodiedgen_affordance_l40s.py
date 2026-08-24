@@ -50,6 +50,28 @@ GRASPGEN_CONFIG = GRASPGEN_ROOT / "graspgen_franka_panda.yml"
 GRASPGEN_GEN = GRASPGEN_ROOT / "graspgen_franka_panda_gen.pth"
 GRASPGEN_DIS = GRASPGEN_ROOT / "graspgen_franka_panda_dis.pth"
 GRASPGEN_MANIFEST = GRASPGEN_ROOT / "manifest.json"
+SEGMENT_PALETTE = [
+    {"name": "Red", "rgb": [230, 25, 75]},
+    {"name": "Green", "rgb": [60, 180, 75]},
+    {"name": "Yellow", "rgb": [255, 225, 25]},
+    {"name": "Blue", "rgb": [0, 130, 200]},
+    {"name": "Orange", "rgb": [245, 130, 48]},
+    {"name": "Purple", "rgb": [145, 30, 180]},
+    {"name": "Cyan", "rgb": [70, 240, 240]},
+    {"name": "Magenta", "rgb": [240, 50, 230]},
+    {"name": "Lime", "rgb": [210, 245, 60]},
+    {"name": "Pink", "rgb": [250, 190, 212]},
+    {"name": "Teal", "rgb": [0, 128, 128]},
+    {"name": "Lavender", "rgb": [220, 190, 255]},
+    {"name": "Brown", "rgb": [170, 110, 40]},
+    {"name": "Beige", "rgb": [255, 250, 200]},
+    {"name": "Maroon", "rgb": [128, 0, 0]},
+    {"name": "Mint", "rgb": [170, 255, 195]},
+    {"name": "Olive", "rgb": [128, 128, 0]},
+    {"name": "Apricot", "rgb": [255, 215, 180]},
+    {"name": "Navy", "rgb": [0, 0, 128]},
+    {"name": "Gray", "rgb": [128, 128, 128]},
+]
 JOB_ROOT = Path("/artifacts/embodiedgen/jobs")
 
 app = modal.App(APP_NAME)
@@ -141,6 +163,7 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: f.read(1024 * 1024), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 
 def _read_glb_document(glb_path: Path):
@@ -555,15 +578,7 @@ def segment_job(
         dense[face_ids == old_id] = new_id
 
     palette = np.asarray(
-        [
-            [230, 25, 75, 255], [60, 180, 75, 255], [255, 225, 25, 255],
-            [0, 130, 200, 255], [245, 130, 48, 255], [145, 30, 180, 255],
-            [70, 240, 240, 255], [240, 50, 230, 255], [210, 245, 60, 255],
-            [250, 190, 212, 255], [0, 128, 128, 255], [220, 190, 255, 255],
-            [170, 110, 40, 255], [255, 250, 200, 255], [128, 0, 0, 255],
-            [170, 255, 195, 255], [128, 128, 0, 255], [255, 215, 180, 255],
-            [0, 0, 128, 255], [128, 128, 128, 255],
-        ],
+        [entry["rgb"] + [255] for entry in SEGMENT_PALETTE],
         dtype=np.uint8,
     )
     face_colors = np.zeros((len(dense), 4), dtype=np.uint8)
@@ -603,6 +618,14 @@ def segment_job(
         "face_count": int(len(dense)),
         "part_count": int(len(valid)),
         "part_face_counts": counts,
+        "palette": [
+            {
+                "id": str(part_id),
+                "name": SEGMENT_PALETTE[part_id % len(SEGMENT_PALETTE)]["name"],
+                "rgb": SEGMENT_PALETTE[part_id % len(SEGMENT_PALETTE)]["rgb"],
+            }
+            for part_id in range(len(valid))
+        ],
         "aabb": np.asarray(aabb).tolist(),
         "face_ids": dense.tolist(),
     }

@@ -259,6 +259,352 @@ def _sha256_file(path: Path) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
+def normalize_semantic_category(value: str | None) -> str:
+    category = "unknown object" if value is None else str(value).strip()
+    if not category or len(category) > 160:
+        raise ValueError("semantic category must be a non-empty string <= 160 chars")
+    return category
+
+
+def semantic_parts_from_segmentation(
+    p3sam_payload: dict, compiler_segmentation: dict
+) -> list[dict]:
+    """Bind semantic mask-color names to the exact provider segment IDs."""
+    if not isinstance(p3sam_payload, dict) or not isinstance(compiler_segmentation, dict):
+        raise TypeError("semantic segmentation payloads must be objects")
+    palette = p3sam_payload.get("palette")
+    segments = compiler_segmentation.get("segments")
+    if not isinstance(palette, list) or not palette:
+        raise ValueError("P3-SAM payload is missing persisted palette metadata")
+    if not isinstance(segments, list) or not segments:
+        raise ValueError("compiler-native segmentation is missing segments")
+    palette_by_id = {}
+    color_names = set()
+    for item in palette:
+        if not isinstance(item, dict):
+            raise ValueError("P3-SAM palette item must be an object")
+        part_id = str(item.get("id") or "").strip()
+        name = str(item.get("name") or "").strip()
+        rgb = item.get("rgb")
+        if not part_id or part_id in palette_by_id:
+            raise ValueError(f"invalid or duplicate P3-SAM palette id: {part_id!r}")
+        if not name or name in color_names:
+            raise ValueError(f"invalid or duplicate P3-SAM palette color name: {name!r}")
+        if (
+            not isinstance(rgb, list)
+            or len(rgb) != 3
+            or any(isinstance(x, bool) or not isinstance(x, int) or not 0 <= x <= 255 for x in rgb)
+        ):
+            raise ValueError(f"invalid P3-SAM palette RGB for {part_id}")
+        palette_by_id[part_id] = {"id": part_id, "maskColor": name, "maskRgb": list(rgb)}
+        color_names.add(name)
+
+    compiler_ids = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            raise ValueError("compiler-native segment must be an object")
+        part_id = str(segment.get("id") or "").strip()
+        if not part_id or part_id in compiler_ids:
+            raise ValueError(f"invalid or duplicate compiler segment id: {part_id!r}")
+        compiler_ids.append(part_id)
+    if set(compiler_ids) != set(palette_by_id):
+        raise ValueError(
+            f"P3-SAM palette IDs do not match compiler segment IDs: "
+            f"palette={sorted(palette_by_id)} compiler={sorted(compiler_ids)}"
+        )
+    return [palette_by_id[part_id] for part_id in compiler_ids]
+
+
+def semantic_grid_diagnostics(path: Path, *, expected_size: tuple[int, int] = (1536, 1024)) -> dict:
+    """Reject blank/corrupt render grids before they become GPT inputs."""
+    import numpy as np
+    from PIL import Image
+
+    with Image.open(path) as image:
+        rgb = image.convert("RGB")
+        if rgb.size != expected_size:
+            raise RuntimeError(f"unexpected semantic grid size for {path.name}: {rgb.size}")
+        array = np.asarray(rgb, dtype=np.float32)
+    flat = array.reshape(-1, 3)
+    std = flat.std(axis=0)
+    unique_sample = np.unique(flat[:: max(1, len(flat) // 50000)].astype(np.uint8), axis=0)
+    result = {
+        "size": list(expected_size),
+        "channelStd": [round(float(x), 4) for x in std],
+        "sampleUniqueColors": int(len(unique_sample)),
+        "nonBlackPixels": int(np.sum(np.max(flat, axis=1) > 12.0)),
+    }
+    if result["nonBlackPixels"] < 1000 or max(result["channelStd"]) < 2.0:
+        raise RuntimeError(f"semantic grid is blank/degenerate: {path.name} diagnostics={result}")
+    return result
+
+
+def semantic_mask_palette_visibility(path: Path, parts: list[dict]) -> dict:
+    """Measure exact RGB visibility in the aligned global mask; hidden parts may be atlas-only."""
+    import numpy as np
+    from PIL import Image
+
+    with Image.open(path) as image:
+        pixels = np.asarray(image.convert("RGB"), dtype=np.uint8).reshape(-1, 3)
+    counts = {}
+    for part in parts:
+        part_id = str(part["id"])
+        target = np.asarray(part["maskRgb"], dtype=np.uint8)
+        counts[part_id] = int(np.sum(np.all(pixels == target[None, :], axis=1)))
+    if not any(count >= 100 for count in counts.values()):
+        raise RuntimeError(f"semantic global mask contains no visible palette parts: {counts}")
+    return {
+        "visiblePixelsByPart": counts,
+        "hiddenPartIds": [part_id for part_id, count in counts.items() if count < 100],
+        "match": "exact-rgb",
+    }
+
+
+def render_semantic_face_label_grid(
+    source_glb: Path,
+    compiler_segmentation: dict,
+    parts: list[dict],
+    output_dir: Path,
+    *,
+    num_images: int = 6,
+    grid_rows: int = 2,
+    grid_cols: int = 3,
+    view_size: int = 512,
+) -> tuple[Path, list[Path], dict]:
+    """Rasterize exact GLB triangle IDs with the same camera settings as render_grid()."""
+    import math
+
+    import nvdiffrast.torch as dr
+    import numpy as np
+    import torch
+    from PIL import Image
+    from embodied_gen.data.utils import (
+        CameraSetting,
+        DiffrastRender,
+        import_kaolin_mesh,
+        init_kal_camera,
+        normalize_vertices_array,
+    )
+    from embodied_gen.utils.process_media import combine_images_to_grid
+
+    materialization = compiler_segmentation.get("materialization")
+    if not isinstance(materialization, dict):
+        raise RuntimeError("compiler-native segmentation is missing materialization")
+    primitives = materialization.get("primitives")
+    if not isinstance(primitives, list) or len(primitives) != 1:
+        raise RuntimeError(
+            f"semantic raster v1 requires exactly one GLB primitive, got {0 if not isinstance(primitives, list) else len(primitives)}"
+        )
+    primitive = primitives[0]
+    if primitive.get("primitive") != 0:
+        raise RuntimeError("semantic raster v1 requires primitive index 0")
+    raw_labels = primitive.get("faceLabels")
+    if not isinstance(raw_labels, list) or not raw_labels:
+        raise RuntimeError("semantic raster requires non-empty faceLabels")
+
+    palette_by_id = {str(part["id"]): list(part["maskRgb"]) for part in parts}
+    face_rgb = []
+    for label in raw_labels:
+        part_id = str(label)
+        if part_id not in palette_by_id:
+            raise RuntimeError(f"semantic raster face label has no palette entry: {part_id}")
+        face_rgb.append(palette_by_id[part_id])
+
+    mesh = import_kaolin_mesh(str(source_glb), with_mtl=False)
+    mesh.vertices, _, _ = normalize_vertices_array(mesh.vertices)
+    mesh = mesh.to("cuda")
+    if len(mesh.faces) != len(face_rgb):
+        raise RuntimeError(
+            f"semantic raster face count mismatch: glb={len(mesh.faces)} labels={len(face_rgb)}"
+        )
+
+    camera_params = CameraSetting(
+        num_images=num_images,
+        elevation=(45.0, -45.0),
+        distance=5.0,
+        resolution_hw=(view_size, view_size),
+        fov=math.radians(30.0),
+        device="cuda",
+    )
+    camera = init_kal_camera(camera_params)
+    mv = camera.view_matrix()
+    projection = camera.intrinsics.projection_matrix()
+    projection[:, 1, 1] = -projection[:, 1, 1]
+    renderer = DiffrastRender(
+        p_matrix=projection,
+        mv_matrix=mv,
+        resolution_hw=camera_params.resolution_hw,
+        context=dr.RasterizeCudaContext(),
+        mask_thresh=0.5,
+        grad_db=False,
+        antialias_mask=False,
+        device="cuda",
+    )
+    rast, _ = renderer.compute_dr_raster(mesh.vertices, mesh.faces.to(torch.int32))
+    face_index = rast[..., 3].long() - 1
+    colors = torch.as_tensor(face_rgb, dtype=torch.uint8, device="cuda")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    view_paths = []
+    visible_faces = set()
+    for view_index in range(num_images):
+        ids = face_index[view_index]
+        valid = ids >= 0
+        image = torch.zeros((view_size, view_size, 3), dtype=torch.uint8, device="cuda")
+        if torch.any(valid):
+            image[valid] = colors[ids[valid]]
+            visible_faces.update(int(x) for x in torch.unique(ids[valid]).detach().cpu().tolist())
+        path = output_dir / f"mask_{view_index:03d}.png"
+        Image.fromarray(image.detach().cpu().numpy(), mode="RGB").save(path)
+        view_paths.append(path)
+
+    if not visible_faces:
+        raise RuntimeError("semantic raster produced no visible faces")
+    grid = combine_images_to_grid(
+        [str(path) for path in view_paths],
+        cat_row_col=(grid_rows, grid_cols),
+        target_wh=(view_size, view_size),
+        image_mode="RGB",
+    )[0]
+    grid_path = output_dir / "affordance_grid.png"
+    grid.save(grid_path)
+    stats = {
+        "renderer": "nvdiffrast-face-id",
+        "camera": {
+            "numImages": num_images,
+            "elevation": [45.0, -45.0],
+            "distance": 5.0,
+            "resolution": [view_size, view_size],
+            "fovDegrees": 30.0,
+        },
+        "glbFaces": len(mesh.faces),
+        "labeledFaces": len(face_rgb),
+        "visibleFaceCount": len(visible_faces),
+    }
+    return grid_path, view_paths, stats
+
+
+def render_semantic_part_atlas(
+    source_glb: Path,
+    compiler_segmentation: dict,
+    parts: list[dict],
+    output_path: Path,
+    *,
+    view_size: int = 160,
+    views_per_part: int = 3,
+    atlas_columns: int = 2,
+) -> dict:
+    """Render each part in isolation so occluded/internal parts still have visual evidence."""
+    import math
+
+    import nvdiffrast.torch as dr
+    import numpy as np
+    import torch
+    from PIL import Image, ImageDraw
+    from embodied_gen.data.utils import (
+        CameraSetting,
+        DiffrastRender,
+        import_kaolin_mesh,
+        init_kal_camera,
+        normalize_vertices_array,
+    )
+
+    primitives = compiler_segmentation.get("materialization", {}).get("primitives")
+    if not isinstance(primitives, list) or len(primitives) != 1:
+        raise RuntimeError("semantic part atlas v1 requires exactly one GLB primitive")
+    labels = primitives[0].get("faceLabels")
+    if not isinstance(labels, list) or not labels:
+        raise RuntimeError("semantic part atlas requires non-empty faceLabels")
+
+    mesh = import_kaolin_mesh(str(source_glb), with_mtl=False).to("cuda")
+    faces = mesh.faces.to(torch.int64)
+    if len(faces) != len(labels):
+        raise RuntimeError(
+            f"semantic part atlas face count mismatch: glb={len(faces)} labels={len(labels)}"
+        )
+    label_array = np.asarray([str(x) for x in labels], dtype=object)
+    part_by_id = {str(part["id"]): part for part in parts}
+    if set(label_array.tolist()) != set(part_by_id):
+        raise RuntimeError("semantic part atlas labels do not match palette part IDs")
+
+    cell_header = 24
+    cell_width = view_size * views_per_part
+    cell_height = view_size + cell_header
+    rows = (len(parts) + atlas_columns - 1) // atlas_columns
+    atlas = Image.new("RGB", (cell_width * atlas_columns, cell_height * rows), (18, 18, 18))
+    atlas_draw = ImageDraw.Draw(atlas)
+    visible_pixels = {}
+
+    for ordinal, part in enumerate(parts):
+        part_id = str(part["id"])
+        face_indices_np = np.flatnonzero(label_array == part_id)
+        if len(face_indices_np) == 0:
+            raise RuntimeError(f"semantic part atlas has no faces for part {part_id}")
+        face_indices = torch.as_tensor(face_indices_np, device="cuda", dtype=torch.int64)
+        part_faces_original = faces[face_indices]
+        unique_vertices, inverse = torch.unique(
+            part_faces_original.reshape(-1), sorted=True, return_inverse=True
+        )
+        part_vertices = mesh.vertices[unique_vertices].clone()
+        part_faces = inverse.reshape(-1, 3).to(torch.int32)
+        part_vertices, _, _ = normalize_vertices_array(part_vertices)
+
+        camera_params = CameraSetting(
+            num_images=views_per_part,
+            elevation=(20.0,),
+            distance=5.0,
+            resolution_hw=(view_size, view_size),
+            fov=math.radians(30.0),
+            device="cuda",
+        )
+        camera = init_kal_camera(camera_params)
+        mv = camera.view_matrix()
+        projection = camera.intrinsics.projection_matrix()
+        projection[:, 1, 1] = -projection[:, 1, 1]
+        renderer = DiffrastRender(
+            p_matrix=projection,
+            mv_matrix=mv,
+            resolution_hw=camera_params.resolution_hw,
+            context=dr.RasterizeCudaContext(),
+            mask_thresh=0.5,
+            grad_db=False,
+            antialias_mask=False,
+            device="cuda",
+        )
+        rast, _ = renderer.compute_dr_raster(part_vertices, part_faces)
+        masks = rast[..., 3] > 0
+        rgb = torch.as_tensor(part["maskRgb"], dtype=torch.uint8, device="cuda")
+        count = int(masks.sum().item())
+        visible_pixels[part_id] = count
+        if count < 100:
+            raise RuntimeError(f"semantic part atlas cannot render part {part_id}: pixels={count}")
+
+        col = ordinal % atlas_columns
+        row = ordinal // atlas_columns
+        x0 = col * cell_width
+        y0 = row * cell_height
+        atlas_draw.text(
+            (x0 + 6, y0 + 5),
+            f"part {part_id}  {part['maskColor']}",
+            fill=tuple(int(x) for x in part["maskRgb"]),
+        )
+        for view_index in range(views_per_part):
+            image = torch.zeros((view_size, view_size, 3), dtype=torch.uint8, device="cuda")
+            image[masks[view_index]] = rgb
+            panel = Image.fromarray(image.detach().cpu().numpy(), mode="RGB")
+            atlas.paste(panel, (x0 + view_index * view_size, y0 + cell_header))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    atlas.save(output_path)
+    return {
+        "renderer": "nvdiffrast-isolated-part-atlas",
+        "viewsPerPart": views_per_part,
+        "viewSize": view_size,
+        "columns": atlas_columns,
+        "rows": rows,
+        "visiblePixelsByPart": visible_pixels,
+    }
+
 def new_job_id() -> str:
     import uuid
 
@@ -1821,6 +2167,176 @@ def run_job(job_id: str, profile: str, prompt: str | None=None, text_seed: int=0
         raise
 
 
+
+
+@app.function(
+    image=image,
+    gpu="L40S",
+    volumes={"/artifacts": artifacts},
+    timeout=20 * 60,
+    cpu=4.0,
+    memory=16384,
+    min_containers=0,
+    max_containers=1,
+    buffer_containers=0,
+    scaledown_window=30,
+)
+def prepare_affordance_semantic_inputs(
+    job_id: str,
+    category: str = "unknown object",
+) -> dict:
+    """Render aligned RGB/mask grids and publish a hash-bound semantic input manifest."""
+    import shutil
+
+    from embodied_gen.utils.vis_utils import render_grid
+
+    if not is_api_job_id(job_id):
+        raise ValueError("invalid API job id")
+    category = normalize_semantic_category(category)
+    artifacts.reload()
+    root = api_job_root(job_id)
+    source_glb = root / AFFORDANCE_RESULT_FILES["source_glb"]
+    p3sam_json = root / "affordance/part_segmentation.json"
+    compiler_segmentation_path = root / AFFORDANCE_RESULT_FILES["part_segmentation"]
+    for label, path in (
+        ("source GLB", source_glb),
+        ("P3-SAM segmentation", p3sam_json),
+        ("compiler-native segmentation", compiler_segmentation_path),
+    ):
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"semantic input requires {label}: {path.relative_to(root)}")
+
+    p3sam_payload = json.loads(p3sam_json.read_text())
+    compiler_segmentation = json.loads(compiler_segmentation_path.read_text())
+    parts = semantic_parts_from_segmentation(p3sam_payload, compiler_segmentation)
+    if int(p3sam_payload.get("part_count", -1)) != len(parts):
+        raise RuntimeError("P3-SAM part_count does not match semantic palette parts")
+
+    staging = root / "affordance/.semantic_inputs_staging"
+    final_dir = root / "affordance/semantic_inputs"
+    shutil.rmtree(staging, ignore_errors=True)
+    staging.mkdir(parents=True, exist_ok=False)
+    try:
+        rgb_grid_path, rgb_views = render_grid(
+            str(source_glb),
+            str(staging),
+            output_subdir="rgb_views",
+            num_images=6,
+            grid_rows=2,
+            grid_cols=3,
+            view_size=512,
+        )
+        mask_grid_path, mask_views, mask_raster = render_semantic_face_label_grid(
+            source_glb,
+            compiler_segmentation,
+            parts,
+            staging / "mask_views",
+            num_images=6,
+            grid_rows=2,
+            grid_cols=3,
+            view_size=512,
+        )
+        if len(rgb_views) != 6 or len(mask_views) != 6:
+            raise RuntimeError(
+                f"semantic renderer expected 6+6 views, got {len(rgb_views)}+{len(mask_views)}"
+            )
+        rgb_final = staging / "rgb_grid.png"
+        mask_final = staging / "mask_grid.png"
+        atlas_final = staging / "part_atlas.png"
+        shutil.copy2(rgb_grid_path, rgb_final)
+        shutil.copy2(mask_grid_path, mask_final)
+        atlas_diagnostics = render_semantic_part_atlas(
+            source_glb, compiler_segmentation, parts, atlas_final
+        )
+        rgb_diagnostics = semantic_grid_diagnostics(rgb_final)
+        mask_diagnostics = semantic_grid_diagnostics(mask_final)
+        mask_visibility = semantic_mask_palette_visibility(mask_final, parts)
+        shutil.rmtree(staging / "rgb_views", ignore_errors=True)
+        shutil.rmtree(staging / "mask_views", ignore_errors=True)
+
+        state = job_states.get(job_id) or {}
+        source_job_id = str(
+            state.get("source_job_id")
+            or p3sam_payload.get("source_job_id")
+            or ""
+        ).strip()
+        if not is_api_job_id(source_job_id):
+            raise RuntimeError(f"semantic input cannot resolve source job id: {source_job_id!r}")
+
+        final_rgb_rel = "affordance/semantic_inputs/rgb_grid.png"
+        final_mask_rel = "affordance/semantic_inputs/mask_grid.png"
+        final_atlas_rel = "affordance/semantic_inputs/part_atlas.png"
+        manifest = {
+            "version": 1,
+            "sourceJobId": source_job_id,
+            "outputJobId": job_id,
+            "category": category,
+            "segmentation": {
+                "path": AFFORDANCE_RESULT_FILES["part_segmentation"],
+                "sha256": _sha256_file(compiler_segmentation_path),
+            },
+            "images": {
+                "rgbGrid": {
+                    "path": final_rgb_rel,
+                    "sha256": _sha256_file(rgb_final),
+                    "mediaType": "image/png",
+                },
+                "maskGrid": {
+                    "path": final_mask_rel,
+                    "sha256": _sha256_file(mask_final),
+                    "mediaType": "image/png",
+                },
+                "partAtlas": {
+                    "path": final_atlas_rel,
+                    "sha256": _sha256_file(atlas_final),
+                    "mediaType": "image/png",
+                },
+            },
+            "parts": [
+                {"id": item["id"], "maskColor": item["maskColor"]}
+                for item in parts
+            ],
+            "render": {
+                "renderer": "embodiedgen-rgb+nvdiffrast-face-id",
+                "rgbRenderer": "embodiedgen.render_grid",
+                "embodiedGenCommit": EMBODIEDGEN_COMMIT,
+                "views": 6,
+                "gridRows": 2,
+                "gridCols": 3,
+                "viewSize": 512,
+                "palette": parts,
+                "semanticMask": mask_raster,
+                "rgbDiagnostics": rgb_diagnostics,
+                "maskDiagnostics": mask_diagnostics,
+                "maskVisibility": mask_visibility,
+                "partAtlas": atlas_diagnostics,
+            },
+        }
+        manifest_path = staging / "semantic_inputs.v1.json"
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+        report = {
+            "job_id": job_id,
+            "source_job_id": source_job_id,
+            "category": category,
+            "part_count": len(parts),
+            "rgb_grid_sha256": manifest["images"]["rgbGrid"]["sha256"],
+            "mask_grid_sha256": manifest["images"]["maskGrid"]["sha256"],
+            "part_atlas_sha256": manifest["images"]["partAtlas"]["sha256"],
+            "segmentation_sha256": manifest["segmentation"]["sha256"],
+            "manifest_sha256": _sha256_file(manifest_path),
+            "mask_visible_pixels_by_part": mask_visibility["visiblePixelsByPart"],
+            "result": "AFFORDANCE_SEMANTIC_INPUTS_OK",
+        }
+        (staging / "validation_report.json").write_text(json.dumps(report, indent=2) + "\n")
+
+        shutil.rmtree(final_dir, ignore_errors=True)
+        staging.rename(final_dir)
+        artifacts.commit()
+        print("AFFORDANCE_SEMANTIC_INPUTS_OK", json.dumps(report), flush=True)
+        return report
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
 
 def affordance_runtime_handles():
     """Look up the independently deployed heavy Affordance workers by stable app/function names."""
