@@ -220,8 +220,13 @@ class AffordanceJobTest(unittest.TestCase):
         self.assertEqual(options["profile"], "part-evidence-only")
         self.assertEqual(options["point_num"], 20000)
         self.assertEqual(options["topk"], 20)
+        semantic = runtime.normalize_affordance_options({"profile": "semantic-evidence-v1", "category": " mug "})
+        self.assertEqual(semantic["profile"], "semantic-evidence-v1")
+        self.assertEqual(semantic["category"], "mug")
         with self.assertRaises(ValueError):
             runtime.normalize_affordance_options({"profile": "full"})
+        with self.assertRaises(ValueError):
+            runtime.normalize_affordance_options({"category": "mug"})
         with self.assertRaises(ValueError):
             runtime.normalize_affordance_options({"topk": 81, "num_grasps": 80})
         with self.assertRaises(TypeError):
@@ -239,8 +244,12 @@ class AffordanceJobTest(unittest.TestCase):
         body = source[start:end]
         self.assertLess(body.index('"segment"'), body.index('"grasp_raw"'))
         self.assertLess(body.index('"grasp_raw"'), body.index('"finalize"'))
+        self.assertIn('AFFORDANCE_SEMANTIC_PROFILE', body)
+        self.assertIn('"semantic_inputs"', body)
+        self.assertIn('"semantic_annotate"', body)
+        self.assertLess(body.index('"semantic_inputs"'), body.index('"semantic_annotate"'))
         self.assertIn('output_job_id=job_id', body)
-        self.assertIn('files=sorted(AFFORDANCE_RESULT_FILES)', body)
+        self.assertIn('files=sorted(affordance_result_files(profile))', body)
 
     def test_affordance_finalize_publishes_hash_bound_bundle(self):
         source = RUNTIME.read_text()
@@ -253,8 +262,22 @@ class AffordanceJobTest(unittest.TestCase):
         self.assertIn('segmentation.get("artifact", {}).get("sha256") != primary_sha256', body)
         self.assertIn('raw_grasps.get("evidence_level") != "raw"', body)
         self.assertIn('AFFORDANCE_PART_EVIDENCE_BUNDLE_OK', body)
-        self.assertNotIn('part_semantics', body)
+        self.assertIn('AFFORDANCE_SEMANTIC_EVIDENCE_BUNDLE_OK', body)
+        self.assertIn('"part_semantics"', body)
+        self.assertIn('part semantics IDs do not match segmentation IDs', body)
+        self.assertIn('part semantics validation SHA mismatch', body)
+        self.assertIn('forbidden executable fields', body)
         self.assertNotIn('sapien_grasps', body)
+
+    def test_affordance_result_files_are_profile_scoped(self):
+        base = runtime.affordance_result_files("part-evidence-only")
+        semantic = runtime.affordance_result_files("semantic-evidence-v1")
+        self.assertNotIn("part_semantics", base)
+        self.assertIn("part_semantics", semantic)
+        self.assertIn("semantic_inputs", semantic)
+        self.assertEqual(base["affordance_bundle"], semantic["affordance_bundle"])
+        with self.assertRaises(ValueError):
+            runtime.affordance_result_files("unknown")
 
     def test_affordance_endpoint_requires_succeeded_source_and_async_dispatch(self):
         source = RUNTIME.read_text()

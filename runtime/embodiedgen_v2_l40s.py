@@ -51,7 +51,10 @@ TEXT2IMG_SCALEDOWN_WINDOWS = {
 }
 RETEXTURE_SCALEDOWN_WINDOWS = dict(TEXT2IMG_SCALEDOWN_WINDOWS)
 AFFORDANCE_APP_NAME = "modal-3d-embodiedgen-affordance"
+AFFORDANCE_SEMANTIC_APP_NAME = "modal-3d-embodiedgen-affordance-semantic"
 AFFORDANCE_PROFILE = "part-evidence-only"
+AFFORDANCE_SEMANTIC_PROFILE = "semantic-evidence-v1"
+AFFORDANCE_PROFILES = {AFFORDANCE_PROFILE, AFFORDANCE_SEMANTIC_PROFILE}
 AFFORDANCE_DEFAULT_OPTIONS = {
     "point_num": 20000,
     "prompt_num": 64,
@@ -211,16 +214,19 @@ def normalize_affordance_options(payload: dict | None) -> dict:
         "num_grasps",
         "topk",
         "seed",
+        "category",
     }
     unknown = sorted(set(payload) - allowed)
     if unknown:
         raise ValueError(f"unsupported affordance options: {unknown}")
     profile = payload.get("profile", AFFORDANCE_PROFILE)
-    if profile != AFFORDANCE_PROFILE:
+    if profile not in AFFORDANCE_PROFILES:
         raise ValueError(f"unsupported affordance profile: {profile!r}")
+    if profile == AFFORDANCE_PROFILE and "category" in payload:
+        raise ValueError("category is only supported by semantic-evidence-v1")
     defaults = AFFORDANCE_DEFAULT_OPTIONS
     options = {
-        "profile": AFFORDANCE_PROFILE,
+        "profile": profile,
         "point_num": payload.get("point_num", defaults["point_num"]),
         "prompt_num": payload.get("prompt_num", defaults["prompt_num"]),
         "prompt_bs": payload.get("prompt_bs", defaults["prompt_bs"]),
@@ -229,6 +235,8 @@ def normalize_affordance_options(payload: dict | None) -> dict:
         "topk": payload.get("topk", defaults["topk"]),
         "seed": payload.get("seed", defaults["seed"]),
     }
+    if profile == AFFORDANCE_SEMANTIC_PROFILE:
+        options["category"] = normalize_semantic_category(payload.get("category"))
     for key in ("point_num", "prompt_num", "prompt_bs", "grasp_num_points", "num_grasps", "topk", "seed"):
         value = options[key]
         if isinstance(value, bool) or not isinstance(value, int):
@@ -686,8 +694,24 @@ AFFORDANCE_RESULT_FILES = {
     "affordance_bundle": "affordance/bundle.v1.json",
     "affordance_validation": "validation_report.json",
 }
+AFFORDANCE_SEMANTIC_RESULT_FILES = {
+    "semantic_inputs": "affordance/semantic_inputs/semantic_inputs.v1.json",
+    "semantic_rgb_grid": "affordance/semantic_inputs/rgb_grid.png",
+    "semantic_mask_grid": "affordance/semantic_inputs/mask_grid.png",
+    "semantic_part_atlas": "affordance/semantic_inputs/part_atlas.png",
+    "part_semantics": "affordance/part_semantics.v1.json",
+    "semantic_validation": "affordance/semantic_validation_report.json",
+}
 
-ALL_RESULT_FILES = {**RESULT_FILES, **AFFORDANCE_RESULT_FILES}
+def affordance_result_files(profile: str) -> dict:
+    if profile == AFFORDANCE_PROFILE:
+        return dict(AFFORDANCE_RESULT_FILES)
+    if profile == AFFORDANCE_SEMANTIC_PROFILE:
+        return {**AFFORDANCE_RESULT_FILES, **AFFORDANCE_SEMANTIC_RESULT_FILES}
+    raise ValueError(f"unsupported affordance profile: {profile!r}")
+
+
+ALL_RESULT_FILES = {**RESULT_FILES, **AFFORDANCE_RESULT_FILES, **AFFORDANCE_SEMANTIC_RESULT_FILES}
 
 
 def simplify_mesh_if_needed(vertices, faces, simplify_fn, target_faces: int = TARGET_MESH_FACES):
@@ -2339,11 +2363,15 @@ def prepare_affordance_semantic_inputs(
         raise
 
 def affordance_runtime_handles():
-    """Look up the independently deployed heavy Affordance workers by stable app/function names."""
+    """Look up independently deployed Affordance workers by stable app/function names."""
     return (
         modal.Function.from_name(AFFORDANCE_APP_NAME, "segment_job"),
         modal.Function.from_name(AFFORDANCE_APP_NAME, "raw_grasp_job"),
     )
+
+
+def affordance_semantic_handle():
+    return modal.Function.from_name(AFFORDANCE_SEMANTIC_APP_NAME, "annotate_semantics")
 
 
 @app.function(
@@ -2365,6 +2393,8 @@ def finalize_affordance_bundle(job_id: str, source_job_id: str, options: dict) -
     artifacts.reload()
     root = api_job_root(job_id)
     source_root = api_job_root(source_job_id)
+    profile = options["profile"]
+    result_files = affordance_result_files(profile)
     paths = {
         "primary_glb": root / AFFORDANCE_RESULT_FILES["source_glb"],
         "source_urdf": root / AFFORDANCE_RESULT_FILES["source_urdf"],
@@ -2373,6 +2403,11 @@ def finalize_affordance_bundle(job_id: str, source_job_id: str, options: dict) -
         "segment_validation": root / AFFORDANCE_RESULT_FILES["segment_validation"],
         "grasp_validation": root / AFFORDANCE_RESULT_FILES["grasp_validation"],
     }
+    if profile == AFFORDANCE_SEMANTIC_PROFILE:
+        paths.update(
+            part_semantics=root / AFFORDANCE_SEMANTIC_RESULT_FILES["part_semantics"],
+            semantic_validation=root / AFFORDANCE_SEMANTIC_RESULT_FILES["semantic_validation"],
+        )
     missing = [name for name, path in paths.items() if not path.is_file() or path.stat().st_size <= 0]
     if missing:
         raise RuntimeError(f"affordance finalize missing artifacts: {missing}")
@@ -2402,6 +2437,32 @@ def finalize_affordance_bundle(job_id: str, source_job_id: str, options: dict) -
     if not isinstance(grasps, list) or not grasps:
         raise RuntimeError("raw grasp evidence contains no grasp candidates")
 
+    semantics = None
+    if profile == AFFORDANCE_SEMANTIC_PROFILE:
+        semantics = json.loads(paths["part_semantics"].read_text())
+        semantic_validation = json.loads(paths["semantic_validation"].read_text())
+        if semantics.get("version") != 1 or semantics.get("source") != "embodiedgen/gpt-part-semantics":
+            raise RuntimeError("unexpected part semantics schema")
+        if semantics.get("sourceJobId") != source_job_id or semantics.get("outputJobId") != job_id:
+            raise RuntimeError("part semantics job lineage mismatch")
+        semantic_parts = semantics.get("parts")
+        if not isinstance(semantic_parts, list) or not semantic_parts:
+            raise RuntimeError("part semantics contains no parts")
+        semantic_ids = {str(item.get("id")) for item in semantic_parts if isinstance(item, dict)}
+        segment_ids = {str(item.get("id")) for item in segmentation.get("segments", []) if isinstance(item, dict)}
+        if semantic_ids != segment_ids:
+            raise RuntimeError(
+                f"part semantics IDs do not match segmentation IDs: semantic={sorted(semantic_ids)} segment={sorted(segment_ids)}"
+            )
+        semantics_sha256 = _sha256_file(paths["part_semantics"])
+        if semantic_validation.get("output_sha256") != semantics_sha256:
+            raise RuntimeError("part semantics validation SHA mismatch")
+        forbidden = {"joint", "joint_type", "axis", "anchors", "limits", "motor", "actions", "pickup_verified", "runtime_verified"}
+        for item in semantic_parts:
+            bad = forbidden.intersection(item)
+            if bad:
+                raise RuntimeError(f"part semantics contains forbidden executable fields: {sorted(bad)}")
+
     def descriptor(identifier: str, role: str, media_type: str, path: Path) -> dict:
         return {
             "id": identifier,
@@ -2424,7 +2485,7 @@ def finalize_affordance_bundle(job_id: str, source_job_id: str, options: dict) -
         "lineage": {
             "embodiedGenCommit": EMBODIEDGEN_COMMIT,
             "workflow": "asset.affordance",
-            "workflowVersion": AFFORDANCE_PROFILE,
+            "workflowVersion": profile,
             "seed": options["seed"],
         },
         "artifacts": [
@@ -2437,17 +2498,23 @@ def finalize_affordance_bundle(job_id: str, source_job_id: str, options: dict) -
                 paths["part_segmentation"],
             ),
             descriptor("raw-grasps", "raw_grasps", "application/json", paths["raw_grasps"]),
+            *(
+                [descriptor("semantics", "part_semantics", "application/json", paths["part_semantics"])]
+                if semantics is not None
+                else []
+            ),
         ],
     }
     bundle_path = root / AFFORDANCE_RESULT_FILES["affordance_bundle"]
     bundle_path.parent.mkdir(parents=True, exist_ok=True)
     bundle_path.write_text(json.dumps(bundle, indent=2) + "\n")
     checks = {
-        "profile": AFFORDANCE_PROFILE,
+        "profile": profile,
         "source_glb_sha256": primary_sha256,
         "segmentation_faces": int(segmentation.get("faceCount", 0)),
         "segmentation_parts": len(segmentation.get("segments", [])),
         "raw_grasp_count": len(grasps),
+        "semantic_part_count": len(semantics["parts"]) if semantics is not None else 0,
         "bundle_sha256": _sha256_file(bundle_path),
     }
     if checks["segmentation_faces"] <= 0 or checks["segmentation_parts"] <= 0:
@@ -2456,16 +2523,20 @@ def finalize_affordance_bundle(job_id: str, source_job_id: str, options: dict) -
         "job_id": job_id,
         "source_job_id": source_job_id,
         "workflow": "asset.affordance",
-        "profile": AFFORDANCE_PROFILE,
+        "profile": profile,
         "checks": checks,
-        "files": sorted(AFFORDANCE_RESULT_FILES),
-        "result": "AFFORDANCE_PART_EVIDENCE_BUNDLE_OK",
+        "files": sorted(result_files),
+        "result": (
+            "AFFORDANCE_SEMANTIC_EVIDENCE_BUNDLE_OK"
+            if profile == AFFORDANCE_SEMANTIC_PROFILE
+            else "AFFORDANCE_PART_EVIDENCE_BUNDLE_OK"
+        ),
     }
     (root / AFFORDANCE_RESULT_FILES["affordance_validation"]).write_text(
         json.dumps(report, indent=2) + "\n"
     )
     artifacts.commit()
-    print("AFFORDANCE_PART_EVIDENCE_BUNDLE_OK", json.dumps(report), flush=True)
+    print(report["result"], json.dumps(report), flush=True)
     return report
 
 
@@ -2484,8 +2555,9 @@ def run_affordance_job(job_id: str, source_job_id: str, options: dict) -> dict:
     if not is_api_job_id(job_id) or not is_api_job_id(source_job_id):
         raise ValueError("invalid API job id")
     options = normalize_affordance_options(options)
+    profile = options["profile"]
     segment_worker, grasp_worker = affordance_runtime_handles()
-    stages = (
+    stages = [
         (
             "segment",
             lambda: segment_worker.remote(
@@ -2507,8 +2579,19 @@ def run_affordance_job(job_id: str, source_job_id: str, options: dict) -> dict:
                 output_job_id=job_id,
             ),
         ),
-        ("finalize", lambda: finalize_affordance_bundle.remote(job_id, source_job_id, options)),
-    )
+    ]
+    if profile == AFFORDANCE_SEMANTIC_PROFILE:
+        semantic_worker = affordance_semantic_handle()
+        stages.extend(
+            [
+                (
+                    "semantic_inputs",
+                    lambda: prepare_affordance_semantic_inputs.remote(job_id, options["category"]),
+                ),
+                ("semantic_annotate", lambda: semantic_worker.remote(job_id)),
+            ]
+        )
+    stages.append(("finalize", lambda: finalize_affordance_bundle.remote(job_id, source_job_id, options)))
     stage = "dispatch"
     timings = {}
     try:
@@ -2521,19 +2604,19 @@ def run_affordance_job(job_id: str, source_job_id: str, options: dict) -> dict:
             job_id,
             status="succeeded",
             stage="done",
-            profile=AFFORDANCE_PROFILE,
+            profile=profile,
             workflow="asset.affordance",
             source_job_id=source_job_id,
             options=options,
             stage_seconds=timings,
-            files=sorted(AFFORDANCE_RESULT_FILES),
+            files=sorted(affordance_result_files(profile)),
         )
     except Exception as exc:
         _job_update(
             job_id,
             status="failed",
             stage=stage,
-            profile=AFFORDANCE_PROFILE,
+            profile=profile,
             workflow="asset.affordance",
             source_job_id=source_job_id,
             options=options,
@@ -2837,7 +2920,7 @@ def job_api():
             "job_id": job_id,
             "status": "queued",
             "stage": "queued",
-            "profile": AFFORDANCE_PROFILE,
+            "profile": options["profile"],
             "workflow": "asset.affordance",
             "source_job_id": source_job_id,
             "created_epoch": now,
@@ -2847,7 +2930,7 @@ def job_api():
             "input": {
                 "type": "affordance",
                 "source_job_id": source_job_id,
-                "profile": AFFORDANCE_PROFILE,
+                "profile": options["profile"],
                 "options": options,
             },
         }
