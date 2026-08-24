@@ -1,0 +1,11 @@
+{
+  "tag": "fastsam3d-pytorch3d-py311-cu121-torch251-sm89-v1",
+  "python": "3.11",
+  "cuda": "12.1.1",
+  "torch": "2.5.1",
+  "torchvision": "0.20.1",
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "source": "facebookresearch/pytorch3d",
+  "source_revision": "75ebeeaea0908c5527e7b1e305fbc7681382db47"
+}

@@ -91,6 +91,25 @@ the `modal-build-artifacts` Volume. The published Release with the same tag cont
 projects install the released wheels with `uv`, avoiding repeated CUDA compilation.
 
 
+
+## FastSAM3D PyTorch3D / L40S
+
+Environment: `fastsam3d-pytorch3d-py311-cu121-torch251-sm89-v1`
+
+- Python 3.11 / CUDA 12.1.1 / PyTorch 2.5.1 / torchvision 0.20.1
+- CUDA arch 8.9 (Ada / L40S)
+- PyTorch3D pinned to `facebookresearch/pytorch3d@75ebeeaea0908c5527e7b1e305fbc7681382db47`
+- SHA256-manifested wheel bundle, validated by importing the renderer on L40S
+
+Build it with:
+
+```bash
+modal run -m modal_build.fastsam3d_pytorch3d::build
+```
+
+The production FastSAM3D worker installs this released wheel bundle instead of compiling PyTorch3D
+during every image build, cutting repeated CUDA build work out of normal deployments.
+
 ## Hunyuan3D 2.1 Paint / L40S
 
 Environment: `hunyuan3d-2.1-paint-py311-cu124-torch251-sm89-v2`
