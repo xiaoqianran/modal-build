@@ -1,0 +1,12 @@
+{
+  "tag": "hunyuan3d-2.1-paint-py311-cu124-torch251-sm89-v2",
+  "python": "3.11",
+  "cuda": "12.4.1",
+  "torch": "2.5.1",
+  "torchvision": "0.20.1",
+  "pybind11": "2.13.4",
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "source": "Archerkattri/hunyuan2.1-plus-plus",
+  "source_revision": "9efd760fbec8ab490e68b330225ea1fab10de7fd"
+}

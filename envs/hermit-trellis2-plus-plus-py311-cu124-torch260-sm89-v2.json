@@ -1,0 +1,11 @@
+{
+  "tag": "hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v2",
+  "python": "3.11",
+  "cuda": "12.4.1",
+  "torch": "2.6.0",
+  "torchvision": "0.21.0",
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "source": "Archerkattri/hermit-trellis2-plus-plus",
+  "source_revision": "2c8402a92ea97c510c09e278fae557771aad774d"
+}

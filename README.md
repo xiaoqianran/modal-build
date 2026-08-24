@@ -70,7 +70,7 @@ production E2E with OBJ/MTL/texture/GLB/video downloads and zero GPT-init/UV/tra
 
 ## TRELLIS2 / L40S
 
-Environment: `hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v1`
+Environment: `hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v2`
 
 - Python 3.11
 - Ubuntu 22.04
@@ -82,12 +82,34 @@ Environment: `hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v1`
 Build and publish from Modal:
 
 ```bash
-modal run -m modal_build.hermit_trellis2_plus_plus::build_and_release
+modal run -m modal_build.hermit_trellis2_plus_plus_v2::build
 ```
 
-The function is hard-limited to one L40S container and publishes using the Modal Secret
-`modal-build-github`. Runtime projects should install the released wheels with `uv`, avoiding
-repeated CUDA compilation.
+The v2 builder is hard-limited to one L40S container and writes a SHA256-manifested wheel bundle to
+the `modal-build-artifacts` Volume. The published Release with the same tag contains the validated
+`flash-attn`, `nvdiffrast`, `nvdiffrec`, `CuMesh`, `FlexGEMM`, and `o-voxel` wheels. Runtime
+projects install the released wheels with `uv`, avoiding repeated CUDA compilation.
+
+
+## Hunyuan3D 2.1 Paint / L40S
+
+Environment: `hunyuan3d-2.1-paint-py311-cu124-torch251-sm89-v2`
+
+- Python 3.11 / CUDA 12.4.1 / PyTorch 2.5.1 / torchvision 0.20.1
+- CUDA arch 8.9 (Ada / L40S)
+- Source pinned to `Archerkattri/hunyuan2.1-plus-plus@9efd760fbec8ab490e68b330225ea1fab10de7fd`
+- Bundle contains the `custom_rasterizer` CUDA wheel plus the native `mesh_inpaint_processor` extension
+- Every binary and the release archive are SHA256-manifested
+
+Build the exact runtime-native bundle:
+
+```bash
+modal run -m modal_build.hunyuan3d21_paint_v2::build
+```
+
+The resulting bundle is stored in `modal-build-artifacts` and mirrored to the GitHub Release with
+the same tag. The production `modal-3D` Hunyuan worker consumes this bundle directly, so neither
+CUDA rasterization nor mesh inpainting is compiled during a cold image build.
 
 ## EmbodiedGen v2.0.0 / L40S
 
