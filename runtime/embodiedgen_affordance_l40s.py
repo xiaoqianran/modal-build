@@ -243,7 +243,7 @@ def _build_agentscape_segmentation_evidence(
     source_obj: Path,
     primary_glb: Path,
     face_labels,
-    source_job_id: str,
+    artifact_root: Path,
 ) -> dict:
     """Align P3-SAM OBJ face labels to the exact primary GLB primitive triangles."""
     import numpy as np
@@ -397,7 +397,7 @@ def _build_agentscape_segmentation_evidence(
         "segments": segments,
         "artifact": {
             "role": "primary_glb",
-            "path": str(primary_glb.relative_to(JOB_ROOT / source_job_id)),
+            "path": str(primary_glb.relative_to(artifact_root)),
             "sha256": _sha256(primary_glb),
             "bytes": primary_glb.stat().st_size,
             "sourceObjSha256": _sha256(source_obj),
@@ -433,6 +433,7 @@ def segment_job(
     point_num: int = 100000,
     prompt_num: int = 400,
     prompt_bs: int = 8,
+    output_job_id: str | None = None,
 ) -> dict:
     """Run GPT-free P3-SAM segmentation on a succeeded EmbodiedGen job."""
     import os
@@ -445,6 +446,9 @@ def segment_job(
 
     if not _valid_job_id(source_job_id):
         raise ValueError(f"invalid source job id: {source_job_id!r}")
+    output_job_id = output_job_id or source_job_id
+    if not _valid_job_id(output_job_id):
+        raise ValueError(f"invalid output job id: {output_job_id!r}")
     if not (1000 <= point_num <= 200000):
         raise ValueError("point_num must be in 1000..200000")
     if not (8 <= prompt_num <= 800):
@@ -479,6 +483,17 @@ def segment_job(
     source_urdf = source_root / "result/sample_00.urdf"
     if not source_obj.is_file() or not primary_glb.is_file() or not source_urdf.is_file():
         raise FileNotFoundError(f"source job has no validated OBJ/GLB/URDF: {source_job_id}")
+
+    output_root = JOB_ROOT / output_job_id
+    output_root.mkdir(parents=True, exist_ok=True)
+    primary_for_evidence = primary_glb
+    if output_job_id != source_job_id:
+        import shutil
+        source_copy = output_root / "source"
+        source_copy.mkdir(parents=True, exist_ok=True)
+        primary_for_evidence = source_copy / "sample_00.glb"
+        shutil.copy2(primary_glb, primary_for_evidence)
+        shutil.copy2(source_urdf, source_copy / "sample_00.urdf")
 
     device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else ""
     capability = torch.cuda.get_device_capability(0) if torch.cuda.is_available() else None
@@ -558,7 +573,7 @@ def segment_job(
     segmented = mesh.copy()
     segmented.visual = trimesh.visual.ColorVisuals(mesh=segmented, face_colors=face_colors)
 
-    output = source_root / "affordance"
+    output = output_root / "affordance"
     output.mkdir(parents=True, exist_ok=True)
     glb_path = output / "mesh_part_seg.glb"
     json_path = output / "part_segmentation.json"
@@ -568,15 +583,16 @@ def segment_job(
 
     agentscape_evidence = _build_agentscape_segmentation_evidence(
         source_obj=source_obj,
-        primary_glb=primary_glb,
+        primary_glb=primary_for_evidence,
         face_labels=dense,
-        source_job_id=source_job_id,
+        artifact_root=output_root,
     )
     agentscape_path.write_text(json.dumps(agentscape_evidence, separators=(",", ":")) + "\n")
 
     counts = {str(part_id): int(np.sum(dense == part_id)) for part_id in range(len(valid))}
     payload = {
         "source_job_id": source_job_id,
+        "output_job_id": output_job_id,
         "backend": "P3-SAM",
         "hunyuan3d_part_commit": HUNYUAN3D_PART_COMMIT,
         "hunyuan3d_part_model_revision": HUNYUAN3D_PART_MODEL_REVISION,
@@ -618,18 +634,19 @@ def segment_job(
 
     report = {
         "source_job_id": source_job_id,
+        "output_job_id": output_job_id,
         "gpu": device_name,
         "compute_capability": f"{capability[0]}.{capability[1]}",
-        "torch": torch.__version__,
-        "torch_cuda": torch.version.cuda,
+        "torch": str(torch.__version__),
+        "torch_cuda": str(torch.version.cuda),
         "checks": checks,
         "model_load_seconds": round(model_load_seconds, 3),
         "inference_seconds": round(inference_seconds, 3),
         "result": "P3SAM_PART_SEGMENTATION_OK",
         "files": {
-            "part_seg_glb": str(glb_path.relative_to(source_root)),
-            "part_seg_json": str(json_path.relative_to(source_root)),
-            "agentscape_part_segmentation": str(agentscape_path.relative_to(source_root)),
+            "part_seg_glb": str(glb_path.relative_to(output_root)),
+            "part_seg_json": str(json_path.relative_to(output_root)),
+            "agentscape_part_segmentation": str(agentscape_path.relative_to(output_root)),
         },
     }
     report_path.write_text(json.dumps(report, indent=2) + "\n")
@@ -714,6 +731,7 @@ def raw_grasp_job(
     num_grasps: int = 200,
     topk: int = 50,
     seed: int = 42,
+    output_job_id: str | None = None,
 ) -> dict:
     """Run raw GraspGen generator+discriminator without GPT semantic filtering."""
     import os
@@ -727,6 +745,9 @@ def raw_grasp_job(
 
     if not _valid_job_id(source_job_id):
         raise ValueError(f"invalid source job id: {source_job_id!r}")
+    output_job_id = output_job_id or source_job_id
+    if not _valid_job_id(output_job_id):
+        raise ValueError(f"invalid output job id: {output_job_id!r}")
     if not (512 <= num_points <= 20000):
         raise ValueError("num_points must be in 512..20000")
     if not (1 <= num_grasps <= 1000):
@@ -840,6 +861,7 @@ def raw_grasp_job(
     payload = {
         "version": 1,
         "source_job_id": source_job_id,
+        "output_job_id": output_job_id,
         "backend": "GraspGen",
         "evidence_level": "raw",
         "gripper": "franka_panda",
@@ -867,17 +889,20 @@ def raw_grasp_job(
         ],
     }
 
-    output_dir = source_root / "affordance"
+    output_root = JOB_ROOT / output_job_id
+    output_root.mkdir(parents=True, exist_ok=True)
+    output_dir = output_root / "affordance"
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "raw_grasps.franka.v1.json"
     report_path = output_dir / "graspgen_validation_report.json"
     output_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n")
     report = {
         "source_job_id": source_job_id,
+        "output_job_id": output_job_id,
         "gpu": device_name,
         "compute_capability": f"{capability[0]}.{capability[1]}",
-        "torch": torch.__version__,
-        "torch_cuda": torch.version.cuda,
+        "torch": str(torch.__version__),
+        "torch_cuda": str(torch.version.cuda),
         "grasp_count": int(len(grasps_cpu)),
         "score_min": float(confidence_cpu.min()),
         "score_max": float(confidence_cpu.max()),
@@ -886,7 +911,7 @@ def raw_grasp_job(
         "model_load_seconds": round(model_load_seconds, 3),
         "inference_seconds": round(inference_seconds, 3),
         "result": "GRASPGEN_RAW_GRASPS_OK",
-        "file": str(output_path.relative_to(source_root)),
+        "file": str(output_path.relative_to(output_root)),
     }
     report_path.write_text(json.dumps(report, indent=2) + "\n")
     artifacts.commit()

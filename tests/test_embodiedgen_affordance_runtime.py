@@ -94,6 +94,16 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn('rotation_orthogonality_max_error', source)
         self.assertIn('raw_grasps.franka.v1.json', source)
         self.assertIn('evidence_level": "raw"', source)
+        self.assertIn('"torch": str(torch.__version__)', source)
+
+    def test_affordance_workers_support_separate_output_job_root(self):
+        source = RUNTIME.read_text()
+        self.assertIn('output_job_id: str | None = None', source)
+        self.assertIn('output_job_id = output_job_id or source_job_id', source)
+        self.assertIn('output_root = JOB_ROOT / output_job_id', source)
+        self.assertIn('source_copy = output_root / "source"', source)
+        self.assertIn('shutil.copy2(primary_glb, primary_for_evidence)', source)
+        self.assertIn('artifact_root=output_root', source)
 
     def test_segmenter_emits_compiler_native_glb_aligned_evidence(self):
         source = RUNTIME.read_text()

@@ -50,6 +50,17 @@ TEXT2IMG_SCALEDOWN_WINDOWS = {
     "burst": 180,
 }
 RETEXTURE_SCALEDOWN_WINDOWS = dict(TEXT2IMG_SCALEDOWN_WINDOWS)
+AFFORDANCE_APP_NAME = "modal-3d-embodiedgen-affordance"
+AFFORDANCE_PROFILE = "part-evidence-only"
+AFFORDANCE_DEFAULT_OPTIONS = {
+    "point_num": 20000,
+    "prompt_num": 64,
+    "prompt_bs": 8,
+    "grasp_num_points": 2024,
+    "num_grasps": 80,
+    "topk": 20,
+    "seed": 42,
+}
 
 STATIC_AUTOSCALE_PROFILE = "cost_first"
 DEFAULT_REQUEST_PROFILE = "auto"
@@ -184,6 +195,70 @@ def normalize_text_prompt(value: str) -> str:
     return prompt
 
 
+
+def normalize_affordance_options(payload: dict | None) -> dict:
+    """Validate the first production Affordance profile without enabling semantic/SAPIEN stages."""
+    if payload is None:
+        payload = {}
+    if not isinstance(payload, dict):
+        raise TypeError("affordance payload must be an object")
+    allowed = {
+        "profile",
+        "point_num",
+        "prompt_num",
+        "prompt_bs",
+        "grasp_num_points",
+        "num_grasps",
+        "topk",
+        "seed",
+    }
+    unknown = sorted(set(payload) - allowed)
+    if unknown:
+        raise ValueError(f"unsupported affordance options: {unknown}")
+    profile = payload.get("profile", AFFORDANCE_PROFILE)
+    if profile != AFFORDANCE_PROFILE:
+        raise ValueError(f"unsupported affordance profile: {profile!r}")
+    defaults = AFFORDANCE_DEFAULT_OPTIONS
+    options = {
+        "profile": AFFORDANCE_PROFILE,
+        "point_num": payload.get("point_num", defaults["point_num"]),
+        "prompt_num": payload.get("prompt_num", defaults["prompt_num"]),
+        "prompt_bs": payload.get("prompt_bs", defaults["prompt_bs"]),
+        "grasp_num_points": payload.get("grasp_num_points", defaults["grasp_num_points"]),
+        "num_grasps": payload.get("num_grasps", defaults["num_grasps"]),
+        "topk": payload.get("topk", defaults["topk"]),
+        "seed": payload.get("seed", defaults["seed"]),
+    }
+    for key in ("point_num", "prompt_num", "prompt_bs", "grasp_num_points", "num_grasps", "topk", "seed"):
+        value = options[key]
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise TypeError(f"{key} must be an integer")
+    if not 1000 <= options["point_num"] <= 200000:
+        raise ValueError("point_num must be in 1000..200000")
+    if not 8 <= options["prompt_num"] <= 800:
+        raise ValueError("prompt_num must be in 8..800")
+    if not 1 <= options["prompt_bs"] <= 64:
+        raise ValueError("prompt_bs must be in 1..64")
+    if not 512 <= options["grasp_num_points"] <= 20000:
+        raise ValueError("grasp_num_points must be in 512..20000")
+    if not 1 <= options["num_grasps"] <= 1000:
+        raise ValueError("num_grasps must be in 1..1000")
+    if not 1 <= options["topk"] <= min(options["num_grasps"], 200):
+        raise ValueError("topk must be in 1..min(num_grasps, 200)")
+    if not 0 <= options["seed"] <= 2**31 - 1:
+        raise ValueError("seed must be a non-negative 32-bit integer")
+    return options
+
+
+def _sha256_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
 def new_job_id() -> str:
     import uuid
 
@@ -254,6 +329,19 @@ RESULT_FILES = {
     "gs_aligned_ply": "result/mesh/sample_00_gs_aligned.ply",
     "validation": "validation_report.json",
 }
+
+AFFORDANCE_RESULT_FILES = {
+    "source_glb": "source/sample_00.glb",
+    "source_urdf": "source/sample_00.urdf",
+    "part_segmentation": "affordance/agentscape_part_segmentation.v1.json",
+    "raw_grasps": "affordance/raw_grasps.franka.v1.json",
+    "segment_validation": "affordance/validation_report.json",
+    "grasp_validation": "affordance/graspgen_validation_report.json",
+    "affordance_bundle": "affordance/bundle.v1.json",
+    "affordance_validation": "validation_report.json",
+}
+
+ALL_RESULT_FILES = {**RESULT_FILES, **AFFORDANCE_RESULT_FILES}
 
 
 def simplify_mesh_if_needed(vertices, faces, simplify_fn, target_faces: int = TARGET_MESH_FACES):
@@ -1733,6 +1821,212 @@ def run_job(job_id: str, profile: str, prompt: str | None=None, text_seed: int=0
         raise
 
 
+
+def affordance_runtime_handles():
+    """Look up the independently deployed heavy Affordance workers by stable app/function names."""
+    return (
+        modal.Function.from_name(AFFORDANCE_APP_NAME, "segment_job"),
+        modal.Function.from_name(AFFORDANCE_APP_NAME, "raw_grasp_job"),
+    )
+
+
+@app.function(
+    image=control_image,
+    volumes={"/artifacts": artifacts},
+    cpu=0.5,
+    memory=1024,
+    timeout=10 * 60,
+    min_containers=0,
+    max_containers=4,
+    buffer_containers=0,
+    scaledown_window=2,
+)
+def finalize_affordance_bundle(job_id: str, source_job_id: str, options: dict) -> dict:
+    """Validate derived artifacts and publish a versioned bytes/hash-first Affordance bundle."""
+    if not is_api_job_id(job_id) or not is_api_job_id(source_job_id):
+        raise ValueError("invalid API job id")
+    options = normalize_affordance_options(options)
+    artifacts.reload()
+    root = api_job_root(job_id)
+    source_root = api_job_root(source_job_id)
+    paths = {
+        "primary_glb": root / AFFORDANCE_RESULT_FILES["source_glb"],
+        "source_urdf": root / AFFORDANCE_RESULT_FILES["source_urdf"],
+        "part_segmentation": root / AFFORDANCE_RESULT_FILES["part_segmentation"],
+        "raw_grasps": root / AFFORDANCE_RESULT_FILES["raw_grasps"],
+        "segment_validation": root / AFFORDANCE_RESULT_FILES["segment_validation"],
+        "grasp_validation": root / AFFORDANCE_RESULT_FILES["grasp_validation"],
+    }
+    missing = [name for name, path in paths.items() if not path.is_file() or path.stat().st_size <= 0]
+    if missing:
+        raise RuntimeError(f"affordance finalize missing artifacts: {missing}")
+    source_glb = source_root / RESULT_FILES["glb"]
+    source_urdf = source_root / RESULT_FILES["urdf"]
+    if not source_glb.is_file() or not source_urdf.is_file():
+        raise RuntimeError("source job final GLB/URDF is missing during affordance finalize")
+    if _sha256_file(paths["primary_glb"]) != _sha256_file(source_glb):
+        raise RuntimeError("derived primary GLB no longer matches source job GLB")
+    if _sha256_file(paths["source_urdf"]) != _sha256_file(source_urdf):
+        raise RuntimeError("derived source URDF no longer matches source job URDF")
+
+    segmentation = json.loads(paths["part_segmentation"].read_text())
+    raw_grasps = json.loads(paths["raw_grasps"].read_text())
+    primary_sha256 = _sha256_file(paths["primary_glb"])
+    if segmentation.get("version") != 1 or segmentation.get("source") != "embodiedgen/p3sam":
+        raise RuntimeError("unexpected compiler-native segmentation schema")
+    if segmentation.get("artifact", {}).get("sha256") != primary_sha256:
+        raise RuntimeError("segmentation evidence is not bound to derived primary GLB")
+    if raw_grasps.get("version") != 1 or raw_grasps.get("evidence_level") != "raw":
+        raise RuntimeError("unexpected raw grasp evidence schema")
+    if raw_grasps.get("source_job_id") != source_job_id:
+        raise RuntimeError("raw grasp evidence source job mismatch")
+    if raw_grasps.get("output_job_id") not in {None, job_id}:
+        raise RuntimeError("raw grasp evidence output job mismatch")
+    grasps = raw_grasps.get("grasps")
+    if not isinstance(grasps, list) or not grasps:
+        raise RuntimeError("raw grasp evidence contains no grasp candidates")
+
+    def descriptor(identifier: str, role: str, media_type: str, path: Path) -> dict:
+        return {
+            "id": identifier,
+            "role": role,
+            "mediaType": media_type,
+            "sha256": _sha256_file(path),
+            "bytes": path.stat().st_size,
+            "fileName": path.name,
+            "path": str(path.relative_to(root)),
+        }
+
+    bundle = {
+        "version": 1,
+        "provider": "embodiedgen",
+        "sourceJobId": source_job_id,
+        "asset": {
+            "id": f"embodiedgen-{source_job_id}",
+            "label": "EmbodiedGen affordance asset",
+        },
+        "lineage": {
+            "embodiedGenCommit": EMBODIEDGEN_COMMIT,
+            "workflow": "asset.affordance",
+            "workflowVersion": AFFORDANCE_PROFILE,
+            "seed": options["seed"],
+        },
+        "artifacts": [
+            descriptor("primary", "primary_glb", "model/gltf-binary", paths["primary_glb"]),
+            descriptor("urdf", "source_urdf", "application/xml", paths["source_urdf"]),
+            descriptor(
+                "segmentation",
+                "part_segmentation",
+                "application/vnd.agentscape.part-segmentation+json",
+                paths["part_segmentation"],
+            ),
+            descriptor("raw-grasps", "raw_grasps", "application/json", paths["raw_grasps"]),
+        ],
+    }
+    bundle_path = root / AFFORDANCE_RESULT_FILES["affordance_bundle"]
+    bundle_path.parent.mkdir(parents=True, exist_ok=True)
+    bundle_path.write_text(json.dumps(bundle, indent=2) + "\n")
+    checks = {
+        "profile": AFFORDANCE_PROFILE,
+        "source_glb_sha256": primary_sha256,
+        "segmentation_faces": int(segmentation.get("faceCount", 0)),
+        "segmentation_parts": len(segmentation.get("segments", [])),
+        "raw_grasp_count": len(grasps),
+        "bundle_sha256": _sha256_file(bundle_path),
+    }
+    if checks["segmentation_faces"] <= 0 or checks["segmentation_parts"] <= 0:
+        raise RuntimeError(f"invalid segmentation summary: {checks}")
+    report = {
+        "job_id": job_id,
+        "source_job_id": source_job_id,
+        "workflow": "asset.affordance",
+        "profile": AFFORDANCE_PROFILE,
+        "checks": checks,
+        "files": sorted(AFFORDANCE_RESULT_FILES),
+        "result": "AFFORDANCE_PART_EVIDENCE_BUNDLE_OK",
+    }
+    (root / AFFORDANCE_RESULT_FILES["affordance_validation"]).write_text(
+        json.dumps(report, indent=2) + "\n"
+    )
+    artifacts.commit()
+    print("AFFORDANCE_PART_EVIDENCE_BUNDLE_OK", json.dumps(report), flush=True)
+    return report
+
+
+@app.function(
+    image=control_image,
+    cpu=0.25,
+    memory=512,
+    timeout=2 * 60 * 60,
+    min_containers=0,
+    max_containers=8,
+    buffer_containers=0,
+    scaledown_window=2,
+)
+def run_affordance_job(job_id: str, source_job_id: str, options: dict) -> dict:
+    """Cheap orchestrator for the first production Affordance profile."""
+    if not is_api_job_id(job_id) or not is_api_job_id(source_job_id):
+        raise ValueError("invalid API job id")
+    options = normalize_affordance_options(options)
+    segment_worker, grasp_worker = affordance_runtime_handles()
+    stages = (
+        (
+            "segment",
+            lambda: segment_worker.remote(
+                source_job_id,
+                point_num=options["point_num"],
+                prompt_num=options["prompt_num"],
+                prompt_bs=options["prompt_bs"],
+                output_job_id=job_id,
+            ),
+        ),
+        (
+            "grasp_raw",
+            lambda: grasp_worker.remote(
+                source_job_id,
+                num_points=options["grasp_num_points"],
+                num_grasps=options["num_grasps"],
+                topk=options["topk"],
+                seed=options["seed"],
+                output_job_id=job_id,
+            ),
+        ),
+        ("finalize", lambda: finalize_affordance_bundle.remote(job_id, source_job_id, options)),
+    )
+    stage = "dispatch"
+    timings = {}
+    try:
+        for stage, invoke in stages:
+            _job_update(job_id, status="running", stage=stage)
+            started = time.perf_counter()
+            invoke()
+            timings[stage] = round(time.perf_counter() - started, 3)
+        return _job_update(
+            job_id,
+            status="succeeded",
+            stage="done",
+            profile=AFFORDANCE_PROFILE,
+            workflow="asset.affordance",
+            source_job_id=source_job_id,
+            options=options,
+            stage_seconds=timings,
+            files=sorted(AFFORDANCE_RESULT_FILES),
+        )
+    except Exception as exc:
+        _job_update(
+            job_id,
+            status="failed",
+            stage=stage,
+            profile=AFFORDANCE_PROFILE,
+            workflow="asset.affordance",
+            source_job_id=source_job_id,
+            options=options,
+            stage_seconds=timings,
+            error_type=type(exc).__name__,
+            error=str(exc)[:2000],
+        )
+        raise
+
 @app.function(
     image=control_image,
     volumes={"/artifacts": artifacts},
@@ -1788,7 +2082,7 @@ def job_api():
     from fastapi.responses import FileResponse
     from PIL import Image
 
-    web = FastAPI(title="EmbodiedGen Job API", version="1.2")
+    web = FastAPI(title="EmbodiedGen Job API", version="1.3")
 
     @web.get("/health")
     def health():
@@ -1995,6 +2289,70 @@ def job_api():
             raise HTTPException(status_code=503,detail="job dispatch failed") from exc
         return state
 
+    @web.post("/jobs/{source_job_id}/affordance", status_code=202)
+    async def submit_affordance_job(
+        source_job_id: str,
+        payload: dict = Body(..., media_type="application/json"),  # noqa: B008
+    ):
+        if not is_api_job_id(source_job_id):
+            raise HTTPException(status_code=404, detail="source job not found")
+        source_state = await job_states.get.aio(source_job_id)
+        if not source_state or source_state.get("status") != "succeeded":
+            raise HTTPException(status_code=409, detail="source job must be succeeded")
+        try:
+            options = normalize_affordance_options(payload)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        await artifacts.reload.aio()
+        source_root = api_job_root(source_job_id)
+        for name in ("glb", "obj", "urdf"):
+            if not (source_root / RESULT_FILES[name]).is_file():
+                raise HTTPException(status_code=409, detail=f"source job missing required {name}")
+
+        job_id = new_job_id()
+        root = api_job_root(job_id)
+        root.mkdir(parents=True, exist_ok=False)
+        (root / "source_job.txt").write_text(source_job_id + "\n")
+        (root / "affordance_request.json").write_text(json.dumps(options, indent=2) + "\n")
+        await artifacts.commit.aio()
+        now = time.time()
+        state = {
+            "job_id": job_id,
+            "status": "queued",
+            "stage": "queued",
+            "profile": AFFORDANCE_PROFILE,
+            "workflow": "asset.affordance",
+            "source_job_id": source_job_id,
+            "created_epoch": now,
+            "created_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "updated_epoch": now,
+            "updated_at": datetime.fromtimestamp(now, timezone.utc).isoformat(),
+            "input": {
+                "type": "affordance",
+                "source_job_id": source_job_id,
+                "profile": AFFORDANCE_PROFILE,
+                "options": options,
+            },
+        }
+        await job_states.put.aio(job_id, state)
+        try:
+            await run_affordance_job.spawn.aio(job_id, source_job_id, options)
+        except Exception as exc:
+            failed = dict(state)
+            failed.update(
+                status="failed",
+                stage="dispatch",
+                error_type=type(exc).__name__,
+                error=str(exc)[:2000],
+            )
+            stamp = time.time()
+            failed["updated_epoch"] = stamp
+            failed["updated_at"] = datetime.fromtimestamp(stamp, timezone.utc).isoformat()
+            await job_states.put.aio(job_id, failed)
+            raise HTTPException(status_code=503, detail="affordance job dispatch failed") from exc
+        return state
+
     @web.get("/jobs/{job_id}")
     def get_job(job_id: str):
         if not is_api_job_id(job_id):
@@ -2004,17 +2362,26 @@ def job_api():
             raise HTTPException(status_code=404, detail="job not found")
         state = dict(state)
         if state.get("status") == "succeeded":
+            available = state.get("files") or sorted(RESULT_FILES)
             state["file_urls"] = {
-                name: f"/jobs/{job_id}/files/{name}" for name in RESULT_FILES
+                name: f"/jobs/{job_id}/files/{name}"
+                for name in available
+                if name in ALL_RESULT_FILES
             }
         return state
 
     @web.get("/jobs/{job_id}/files/{name}")
     def get_file(job_id: str, name: str):
-        if not is_api_job_id(job_id) or name not in RESULT_FILES:
+        if not is_api_job_id(job_id) or name not in ALL_RESULT_FILES:
+            raise HTTPException(status_code=404, detail="file not found")
+        state = job_states.get(job_id)
+        if not state:
+            raise HTTPException(status_code=404, detail="file not found")
+        available = state.get("files") or sorted(RESULT_FILES)
+        if name not in available:
             raise HTTPException(status_code=404, detail="file not found")
         artifacts.reload()
-        path = api_job_root(job_id) / RESULT_FILES[name]
+        path = api_job_root(job_id) / ALL_RESULT_FILES[name]
         if not path.is_file():
             raise HTTPException(status_code=404, detail="file not found")
         return FileResponse(path, filename=path.name)

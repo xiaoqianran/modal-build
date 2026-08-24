@@ -24,7 +24,7 @@ class JobIdentityTest(unittest.TestCase):
                 runtime.api_job_root(value)
 
     def test_result_file_map_contains_only_relative_safe_paths(self):
-        for value in runtime.RESULT_FILES.values():
+        for value in runtime.ALL_RESULT_FILES.values():
             path = Path(value)
             self.assertFalse(path.is_absolute())
             self.assertNotIn("..", path.parts)
@@ -212,6 +212,67 @@ class RetextureJobTest(unittest.TestCase):
         self.assertIn('await job_states.put.aio(', body)
         self.assertIn('await run_retexture_job.spawn.aio(', body)
         self.assertNotIn('run_retexture_job.spawn(', body)
+
+
+class AffordanceJobTest(unittest.TestCase):
+    def test_affordance_options_are_strict_and_defaulted(self):
+        options = runtime.normalize_affordance_options({})
+        self.assertEqual(options["profile"], "part-evidence-only")
+        self.assertEqual(options["point_num"], 20000)
+        self.assertEqual(options["topk"], 20)
+        with self.assertRaises(ValueError):
+            runtime.normalize_affordance_options({"profile": "full"})
+        with self.assertRaises(ValueError):
+            runtime.normalize_affordance_options({"topk": 81, "num_grasps": 80})
+        with self.assertRaises(TypeError):
+            runtime.normalize_affordance_options({"seed": True})
+        with self.assertRaises(ValueError):
+            runtime.normalize_affordance_options({"semantic": True})
+
+    def test_affordance_orchestrator_uses_separate_deployed_app_and_stage_order(self):
+        source = RUNTIME.read_text()
+        self.assertIn('AFFORDANCE_APP_NAME = "modal-3d-embodiedgen-affordance"', source)
+        self.assertIn('modal.Function.from_name(AFFORDANCE_APP_NAME, "segment_job")', source)
+        self.assertIn('modal.Function.from_name(AFFORDANCE_APP_NAME, "raw_grasp_job")', source)
+        start = source.index("def run_affordance_job(")
+        end = source.index("@app.function(", start)
+        body = source[start:end]
+        self.assertLess(body.index('"segment"'), body.index('"grasp_raw"'))
+        self.assertLess(body.index('"grasp_raw"'), body.index('"finalize"'))
+        self.assertIn('output_job_id=job_id', body)
+        self.assertIn('files=sorted(AFFORDANCE_RESULT_FILES)', body)
+
+    def test_affordance_finalize_publishes_hash_bound_bundle(self):
+        source = RUNTIME.read_text()
+        start = source.index("def finalize_affordance_bundle(")
+        end = source.index("@app.function(", start)
+        body = source[start:end]
+        self.assertIn('"version": 1', body)
+        self.assertIn('"provider": "embodiedgen"', body)
+        self.assertIn('"role": role', body)
+        self.assertIn('segmentation.get("artifact", {}).get("sha256") != primary_sha256', body)
+        self.assertIn('raw_grasps.get("evidence_level") != "raw"', body)
+        self.assertIn('AFFORDANCE_PART_EVIDENCE_BUNDLE_OK', body)
+        self.assertNotIn('part_semantics', body)
+        self.assertNotIn('sapien_grasps', body)
+
+    def test_affordance_endpoint_requires_succeeded_source_and_async_dispatch(self):
+        source = RUNTIME.read_text()
+        start = source.index('    async def submit_affordance_job(')
+        end = source.index('    @web.get("/jobs/{job_id}")', start)
+        body = source[start:end]
+        self.assertIn('source_state.get("status") != "succeeded"', body)
+        self.assertIn('await artifacts.reload.aio()', body)
+        self.assertIn('await artifacts.commit.aio()', body)
+        self.assertIn('await job_states.put.aio(', body)
+        self.assertIn('await run_affordance_job.spawn.aio(', body)
+        self.assertNotIn('run_affordance_job.spawn(', body)
+
+    def test_job_file_urls_are_scoped_to_state_file_roles(self):
+        source = RUNTIME.read_text()
+        self.assertIn('available = state.get("files") or sorted(RESULT_FILES)', source)
+        self.assertIn('if name not in available:', source)
+        self.assertIn('ALL_RESULT_FILES[name]', source)
 
 
 class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
