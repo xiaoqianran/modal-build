@@ -20,7 +20,7 @@ class RuntimePinsTest(unittest.TestCase):
     def test_text2img_snapshot_is_exactly_pinned(self):
         self.assertEqual(runtime.TEXT2IMG_MODEL_ID, "Kwai-Kolors/Kolors-diffusers")
         self.assertRegex(runtime.TEXT2IMG_MODEL_REVISION, r"^[0-9a-f]{40}$")
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn("revision=TEXT2IMG_MODEL_REVISION", source)
         self.assertIn("TEXT2IMG_REVISION_MARKER", source)
         self.assertIn("current_revision != TEXT2IMG_MODEL_REVISION", source)
@@ -29,14 +29,14 @@ class RuntimePinsTest(unittest.TestCase):
     def test_retexture_snapshot_is_exactly_pinned(self):
         self.assertEqual(runtime.RETEXTURE_MODEL_ID, "xinjjj/RoboAssetGen")
         self.assertRegex(runtime.RETEXTURE_MODEL_REVISION, r"^[0-9a-f]{40}$")
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('allow_patterns=["texture_gen_mv_v1/*","super_resolution/*"]', source)
         self.assertIn("revision=RETEXTURE_MODEL_REVISION", source)
 
     def test_retexture_lazy_delight_patch_is_active(self):
         patch = ROOT / "patches" / "embodiedgen-v2.0.0" / "production" / "retexture-lazy-delight.patch"
-        source = RUNTIME.read_text()
-        body = patch.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
+        body = patch.read_text(encoding="utf-8")
         self.assertTrue(patch.is_file())
         self.assertIn("retexture-lazy-delight.patch", source)
         self.assertIn('-from embodied_gen.models.delight_model import DelightingModel', body)
@@ -54,14 +54,14 @@ class RuntimePinsTest(unittest.TestCase):
         )
 
     def test_runtime_verifies_release_archives_before_unzip(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn("sha256sum -c -", source)
         verify_pos = source.index("sha256sum -c -")
         unzip_pos = source.index("unzip -q /tmp/wheels.zip")
         self.assertLess(verify_pos, unzip_pos)
 
     def test_all_direct_git_dependencies_are_pinned(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         urls = re.findall(r"git\+https://github\.com/[^'\"]+", source)
         self.assertTrue(urls)
         for url in urls:
@@ -70,7 +70,7 @@ class RuntimePinsTest(unittest.TestCase):
 
 class ImmutableReleaseTest(unittest.TestCase):
     def test_builder_never_clobbers_release_assets(self):
-        source = BUILDER.read_text()
+        source = BUILDER.read_text(encoding="utf-8")
         self.assertNotIn("--clobber", source)
         self.assertIn("refusing to overwrite immutable artifacts", source)
         self.assertIn("Bump TAG for a new release", source)

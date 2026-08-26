@@ -17,7 +17,7 @@ class AffordanceWeightsTest(unittest.TestCase):
         self.assertRegex(mod.SONATA_WEIGHT_SHA256, r"^[0-9a-f]{64}$")
 
     def test_preloader_records_hashes_and_commits_last(self):
-        source = PRELOADER.read_text()
+        source = PRELOADER.read_text(encoding="utf-8")
         self.assertIn("actual_p3sam_sha256 != P3SAM_WEIGHT_SHA256", source)
         self.assertIn("actual_sonata_sha256 != SONATA_WEIGHT_SHA256", source)
         self.assertIn("weights.commit()", source)

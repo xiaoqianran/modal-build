@@ -123,7 +123,7 @@ class TextJobTest(unittest.TestCase):
             self.assertEqual(source, "generated-text")
 
     def test_text_worker_is_l40s_and_offline(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         pos = source.index("class Text2ImageWorker:")
         decorator = source[source.rfind("@app.cls(", 0, pos):pos]
         body_end = source.index("def _rembg_load", pos)
@@ -135,14 +135,14 @@ class TextJobTest(unittest.TestCase):
         self.assertIn('TRANSFORMERS_OFFLINE', body)
 
     def test_text_stage_runs_before_rembg(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("def run_job(")
         end = source.index("@app.function(", start)
         body = source[start:end]
         self.assertLess(body.index('"text2image"'), body.index('"rembg"'))
 
     def test_text_submit_uses_async_modal_interfaces(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("    async def submit_text_job(")
         end = source.index('    @web.get("/jobs/{job_id}")', start)
         submit = source[start:end]
@@ -182,7 +182,7 @@ class AutoscaleDedupeTest(unittest.TestCase):
 
 class RetextureJobTest(unittest.TestCase):
     def test_retexture_worker_is_single_l40s_offline_pipeline(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         pos = source.index("class RetextureWorker:")
         decorator = source[source.rfind("@app.cls(", 0, pos):pos]
         end = source.index("def _rembg_load", pos)
@@ -194,7 +194,7 @@ class RetextureJobTest(unittest.TestCase):
         self.assertIn('ip_adapt_scale=0.0', body)
 
     def test_retexture_validates_geometry_preservation(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         pos = source.index("class RetextureWorker:")
         end = source.index("def _rembg_load", pos)
         body = source[pos:end]
@@ -203,7 +203,7 @@ class RetextureJobTest(unittest.TestCase):
         self.assertIn('len(src_mesh.faces)==len(objm.faces)', body)
 
     def test_retexture_endpoint_requires_succeeded_source_and_async_spawn(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index('    async def submit_retexture_job(')
         end = source.index('    @web.get("/jobs/{job_id}")', start)
         body = source[start:end]
@@ -235,7 +235,7 @@ class AffordanceJobTest(unittest.TestCase):
             runtime.normalize_affordance_options({"semantic": True})
 
     def test_affordance_orchestrator_uses_separate_deployed_app_and_stage_order(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('AFFORDANCE_APP_NAME = "modal-3d-embodiedgen-affordance"', source)
         self.assertIn('modal.Function.from_name(AFFORDANCE_APP_NAME, "segment_job")', source)
         self.assertIn('modal.Function.from_name(AFFORDANCE_APP_NAME, "raw_grasp_job")', source)
@@ -252,7 +252,7 @@ class AffordanceJobTest(unittest.TestCase):
         self.assertIn('files=sorted(affordance_result_files(profile))', body)
 
     def test_affordance_finalize_publishes_hash_bound_bundle(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("def finalize_affordance_bundle(")
         end = source.index("@app.function(", start)
         body = source[start:end]
@@ -280,7 +280,7 @@ class AffordanceJobTest(unittest.TestCase):
             runtime.affordance_result_files("unknown")
 
     def test_affordance_endpoint_requires_succeeded_source_and_async_dispatch(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index('    async def submit_affordance_job(')
         end = source.index('    @web.get("/jobs/{job_id}")', start)
         body = source[start:end]
@@ -292,7 +292,7 @@ class AffordanceJobTest(unittest.TestCase):
         self.assertNotIn('run_affordance_job.spawn(', body)
 
     def test_job_file_urls_are_scoped_to_state_file_roles(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('available = state.get("files") or sorted(RESULT_FILES)', source)
         self.assertIn('if name not in available:', source)
         self.assertIn('ALL_RESULT_FILES[name]', source)
@@ -320,7 +320,7 @@ class AffordanceSemanticInputTest(unittest.TestCase):
             )
 
     def test_semantic_input_renderer_is_isolated_from_gpt_and_hash_binds_outputs(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("def prepare_affordance_semantic_inputs(")
         end = source.index("def affordance_runtime_handles", start)
         body = source[start:end]
@@ -345,7 +345,7 @@ class AffordanceSemanticInputTest(unittest.TestCase):
         self.assertNotIn('openai', body.lower())
 
     def test_semantic_mask_uses_triangle_id_raster_not_materials(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("def render_semantic_face_label_grid(")
         end = source.index("def new_job_id", start)
         body = source[start:end]
@@ -360,7 +360,7 @@ class AffordanceSemanticInputTest(unittest.TestCase):
         self.assertNotIn('mask_obj', body)
 
     def test_semantic_part_atlas_isolated_views_cover_hidden_parts(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("def render_semantic_part_atlas(")
         end = source.index("def new_job_id", start)
         body = source[start:end]
@@ -444,7 +444,7 @@ class AsyncControlPlaneTest(unittest.IsolatedAsyncioTestCase):
 
 class RuntimeIsolationTest(unittest.TestCase):
     def test_cpu_workers_use_lightweight_cpu_image(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         for marker in ("class RembgWorker:", "class MeshWorker:", "def cpu_finalize("):
             pos = source.index(marker)
             decorator = source[source.rfind("@app.", 0, pos):pos]
@@ -452,7 +452,7 @@ class RuntimeIsolationTest(unittest.TestCase):
         self.assertIn("image=image,\n    gpu=\"L40S\"", source)
 
     def test_async_submit_uses_only_modal_aio_interfaces(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("    async def submit_job(")
         end = source.index("    @web.get(\"/jobs/{job_id}\")", start)
         submit = source[start:end]
@@ -462,7 +462,7 @@ class RuntimeIsolationTest(unittest.TestCase):
             self.assertIn(async_call, submit)
 
     def test_benchmark_fallback_is_preloaded_not_source_checkout(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('/weights/examples/sample_00.jpg', source)
         rembg_start = source.index("def _rembg_load")
         rembg_end = source.index("def _rembg_prepare", rembg_start)

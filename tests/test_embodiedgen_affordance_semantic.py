@@ -52,7 +52,7 @@ class AffordanceSemanticContractTest(unittest.TestCase):
         }
 
     def test_worker_is_isolated_cpu_network_surface_and_uses_uv(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('APP_NAME = "modal-3d-embodiedgen-affordance-semantic"', source)
         self.assertIn('.uv_pip_install("openai==1.101.0", "pillow==11.3.0")', source)
         self.assertIn('SEMANTIC_SECRET_NAME = "modal-3d-embodiedgen-affordance-semantic"', source)
@@ -115,7 +115,7 @@ class AffordanceSemanticContractTest(unittest.TestCase):
             semantic.validate_semantic_response(bad, self.manifest()["parts"])
 
     def test_prompt_and_output_provenance_exclude_credentials(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertRegex(semantic.PROMPT_REVISION, r"^[0-9a-f]{64}$")
         self.assertIn("Do not infer or output joints", semantic.SYSTEM_PROMPT)
         output_block = source[source.index('    output = {') : source.index('    output_path =', source.index('    output = {'))]

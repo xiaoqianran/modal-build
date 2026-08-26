@@ -26,12 +26,12 @@ class AffordanceRuntimeTest(unittest.TestCase):
         for name, digest in runtime.AFFORDANCE_WHEELS.items():
             self.assertTrue(name.endswith(".whl"))
             self.assertRegex(digest, r"^[0-9a-f]{64}$")
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn("sha256sum -c -", source)
         self.assertNotIn("--clobber", source)
 
     def test_consumer_is_runtime_only_and_l40s(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn("nvidia/cuda:12.6.3-runtime-ubuntu22.04", source)
         self.assertIn("! command -v nvcc", source)
         self.assertIn('.apt_install("git", "curl", "libgomp1", "clang")', source)
@@ -40,7 +40,7 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn('"TORCH_CUDA_ARCH_LIST": "8.9"', source)
 
     def test_weights_are_revision_pinned_and_runtime_offline(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('weight_manifest.get("hunyuan3d_part_model_revision")', source)
         self.assertIn('weight_manifest.get("sonata_model_revision")', source)
         self.assertIn('"p3sam": P3SAM_WEIGHT_SHA256', source)
@@ -52,7 +52,7 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn("grep -Fq 'custom_config={\\\"enable_flash\\\": False}'", source)
 
     def test_segmenter_has_no_gpt_dependency(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertNotIn("GPT_CLIENT", source)
         self.assertNotIn("openai", source.lower())
         self.assertIn("from auto_mask import AutoMask", source)
@@ -60,7 +60,7 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn("clean_mesh_flag=False", source)
 
     def test_segmenter_validates_geometry_and_outputs(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn("face label count mismatch", source)
         self.assertIn("P3-SAM returned no valid parts", source)
         self.assertIn('"mesh_part_seg.glb"', source)
@@ -73,7 +73,7 @@ class AffordanceRuntimeTest(unittest.TestCase):
             self.assertFalse(runtime._valid_job_id(value))
 
     def test_graspgen_raw_worker_is_pinned_and_gpt_free(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('GRASPGEN_COMMIT = "a56d518f3b76ea2a432b5b838b3c68027d29be49"', source)
         self.assertIn('GRASPGEN_MODELS_REVISION = "ec1ccbb5eec0680db669246ac312a3636f16ee43"', source)
         self.assertIn('image=grasp_image', source)
@@ -85,7 +85,7 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertNotIn('GPT_CLIENT', source)
 
     def test_graspgen_worker_uses_urdf_collision_frame_and_validates_poses(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('def _load_urdf_collision_mesh', source)
         self.assertIn('collision.find("origin")', source)
         self.assertIn('euler_matrix(*rpy, axes="sxyz")', source)
@@ -97,7 +97,7 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn('"torch": str(torch.__version__)', source)
 
     def test_affordance_workers_support_separate_output_job_root(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('output_job_id: str | None = None', source)
         self.assertIn('output_job_id = output_job_id or source_job_id', source)
         self.assertIn('output_root = JOB_ROOT / output_job_id', source)
@@ -106,14 +106,14 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn('artifact_root=output_root', source)
 
     def test_segmenter_does_not_depend_on_material_mask_rendering(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertNotIn('def _write_segment_mask_obj', source)
         self.assertNotIn('semantic_mask/mesh_part_mask.obj', source)
         self.assertNotIn('map_Kd part_', source)
         self.assertIn('SEGMENT_PALETTE = [', source)
 
     def test_segmenter_persists_the_exact_mask_palette_for_semantics(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('SEGMENT_PALETTE = [', source)
         self.assertIn('{"name": "Yellow", "rgb": [255, 225, 25]}', source)
         self.assertIn('{"name": "Blue", "rgb": [0, 130, 200]}', source)
@@ -121,7 +121,7 @@ class AffordanceRuntimeTest(unittest.TestCase):
         self.assertIn('SEGMENT_PALETTE[part_id % len(SEGMENT_PALETTE)]["name"]', source)
 
     def test_segmenter_emits_compiler_native_glb_aligned_evidence(self):
-        source = RUNTIME.read_text()
+        source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('def _read_glb_document', source)
         self.assertIn('def _glb_accessor_array', source)
         self.assertIn('def _build_agentscape_segmentation_evidence', source)

@@ -18,7 +18,7 @@ class AffordanceBuilderTest(unittest.TestCase):
         self.assertRegex(builder.PINS["torch_scatter_wheel_sha256"], r"^[0-9a-f]{64}$")
 
     def test_builder_is_cpu_only_and_sm89(self):
-        source = BUILDER.read_text()
+        source = BUILDER.read_text(encoding="utf-8")
         build_start = source.index("@app.function", source.index("def wheel_shared_objects"))
         build_end = source.index("@app.function", build_start + 1)
         build_section = source[build_start:build_end]
@@ -28,7 +28,7 @@ class AffordanceBuilderTest(unittest.TestCase):
         self.assertIn('"TORCH_CUDA_ARCH_LIST": "8.9"', source)
 
     def test_bundle_has_three_compiled_wheels(self):
-        source = BUILDER.read_text()
+        source = BUILDER.read_text(encoding="utf-8")
         for token in ("TORCH_SCATTER_WHEEL_URL", "pointnet2_ops", "chamfer3D"):
             self.assertIn(token, source)
         self.assertIn("torch-scatter wheel hash mismatch", source)
@@ -39,14 +39,14 @@ class AffordanceBuilderTest(unittest.TestCase):
 
     def test_p3sam_no_flash_patch_uses_upstream_fallback(self):
         patch = ROOT / "patches" / "embodiedgen-v2.0.0" / "production" / "p3sam-no-flash.patch"
-        body = patch.read_text()
+        body = patch.read_text(encoding="utf-8")
         self.assertIn('custom_config={"enable_flash": False}', body)
         self.assertIn('embodied_gen/utils/monkey_patch/p3sam.py', body)
         self.assertNotIn('diff --git a/P3-SAM/model.py', body)
-        self.assertNotIn('flash-attn', BUILDER.read_text())
+        self.assertNotIn('flash-attn', BUILDER.read_text(encoding="utf-8"))
 
     def test_embodiedgen_pin_guards_submodule_pins(self):
-        source = BUILDER.read_text()
+        source = BUILDER.read_text(encoding="utf-8")
         self.assertIn('clone_at("https://github.com/HorizonRobotics/EmbodiedGen.git"', source)
         self.assertIn('"thirdparty/GraspGen": PINS["graspgen"]', source)
         self.assertIn('"thirdparty/Hunyuan3D-Part": PINS["hunyuan3d_part"]', source)
@@ -54,7 +54,7 @@ class AffordanceBuilderTest(unittest.TestCase):
         self.assertIn('"--depth=1"', source)
 
     def test_l40s_validator_executes_all_native_extensions(self):
-        source = BUILDER.read_text()
+        source = BUILDER.read_text(encoding="utf-8")
         self.assertIn('gpu="L40S"', source)
         self.assertIn('from torch_scatter import scatter', source)
         self.assertIn('import pointnet2_ops._ext as pointnet2_ext', source)
@@ -65,7 +65,7 @@ class AffordanceBuilderTest(unittest.TestCase):
         self.assertIn('staged wheel hash mismatch', source)
 
     def test_staging_is_immutable_and_preemption_safe(self):
-        source = BUILDER.read_text()
+        source = BUILDER.read_text(encoding="utf-8")
         self.assertIn("refusing to overwrite", source)
         self.assertIn("preempt CPU builders", source)
         self.assertLess(source.index('if output.exists()'), source.index('GraspGen pointnet2 CUDA extension'))

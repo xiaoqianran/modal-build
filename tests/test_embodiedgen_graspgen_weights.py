@@ -17,7 +17,7 @@ class GraspGenWeightsTest(unittest.TestCase):
         self.assertRegex(mod.GRASPGEN_DIS_SHA256, r"^[0-9a-f]{64}$")
 
     def test_preloader_is_revision_pinned_and_atomic(self):
-        source = PRELOADER.read_text()
+        source = PRELOADER.read_text(encoding="utf-8")
         self.assertIn("revision=GRASPGEN_MODELS_REVISION", source)
         self.assertIn("graspgen_franka_panda_gen.pth", source)
         self.assertIn("graspgen_franka_panda_dis.pth", source)
