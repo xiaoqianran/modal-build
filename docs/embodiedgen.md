@@ -665,76 +665,51 @@ The local test suite covers autoscale policy plus the new small-mesh bypass, OBJ
 path-escape rejection, missing-texture detection, and validation negative cases. The real MeshWorker
 and finalizer regression runs were CPU-only; no L40S was allocated for these fixes.
 
-## Minimal authenticated Job API
+## Local/VPS direct control plane (current)
 
-The production API layer is intentionally small and exists for concrete operational reasons rather
-than abstraction. It provides only four public operations: submit an image, read job status, download
-a named result file, and health-check the service. The heavy 3D stages remain the same independently
-autoscaled workers; the API/orchestrator never embeds SAM3D or texture models.
+Production orchestration no longer runs in a Modal ASGI gateway or a 0.25-CPU `run_job` Function.
+Those control containers added an avoidable cold-start hop before the real compute workers.
 
-Deploy with:
+The deployed Modal app now contains the compute stages only. The caller/VPS imports
+`runtime/embodiedgen_direct.py` and orchestrates them directly:
 
-```bash
-modal deploy runtime/embodiedgen_v2_l40s.py
+```text
+local/VPS
+  -> Modal Volume batch upload (control plane, no compute container)
+  -> RembgWorker.prepare        CPU
+  -> Sam3DWorker.generate       L40S
+  -> Modal Dict state handoff
+  -> MeshWorker.process         CPU
+  -> lite_gpu_bake              L40S
+  -> cpu_finalize               CPU
 ```
 
-`job_api` uses `requires_proxy_auth=True`, so callers must supply their Modal workspace credentials as
-`Modal-Key` and `Modal-Secret` HTTP headers. Do not place those credentials in source control.
+Text→3D prepends `Text2ImageWorker.generate`; Retexture calls `RetextureWorker.generate` directly;
+Affordance calls its independently deployed segment/grasp/semantic workers directly and then the
+existing finalize function. Job status remains in `modal-3d-embodiedgen-jobs`, artifacts remain in
+`modal-3d-artifacts`, and AUTO traffic events remain in `modal-3d-embodiedgen-traffic`. Those are
+Modal control-plane storage operations and do not start a gateway container.
 
-### Submit
+Example local/VPS usage:
 
-`POST /jobs?profile=auto` accepts the raw image bytes as the request body and returns HTTP 202 with a
-server-generated id of the form `job-<32 hex>`. The API does not accept a caller-controlled filesystem
-job id. Input is capped at 20 MiB and 40 megapixels and is verified with Pillow before any GPU work is
-dispatched.
+```python
+from runtime.embodiedgen_direct import generate_image3d, generate_text3d, retexture
 
-An API job **must** contain its uploaded `input_image`. The Rembg stage is forbidden from silently
-falling back to the repository's `sample_00.jpg` for a `job-*` id; that fallback remains available only
-for legacy/debug benchmark ids.
+image_job = generate_image3d("input.png", profile="auto")
+text_job = generate_text3d("a red ceramic mug", seed=0, profile="auto")
+edit_job = retexture(image_job["job_id"], "matte black ceramic", seed=2)
+```
 
-### Status and files
+`runtime/embodiedgen_v2_l40s.py` still keeps CPU-only preload functions, the scheduled stale-job
+cleanup, and benchmark/local entrypoints. They are not part of each production request's dispatch
+chain and therefore are intentionally not removed.
 
-`GET /jobs/{job_id}` returns the persisted state (`queued`, `running`, `succeeded`, or `failed`), current
-stage, selected autoscale profile and measured stage wall times. Successful jobs expose stable named
-file keys. Files are fetched with `GET /jobs/{job_id}/files/{name}`; the server maps those names to a
-fixed allow-list rather than accepting arbitrary paths.
+## Historical Production Job API (retired)
 
-Current file keys are `glb`, `obj`, `mtl`, `obj_texture`, `urdf`, `video`, `gs_ply`,
-`gs_aligned_ply`, and `validation`.
+The HTTP Job API measurements below are retained as historical validation evidence. The current
+source no longer deploys `job_api`, `run_job`, `run_retexture_job`, or `run_affordance_job`; use the
+local/VPS direct control plane above for production requests.
 
-### Cost-first orchestration
-
-`run_job` is a 0.25-CPU / 512-MiB orchestrator that waits on the existing Rembg, Heavy SAM3D,
-MeshWorker, Lite L40S and Finalize stages. It can never allocate GPU itself. This keeps orchestration
-cost negligible while preserving the already-validated per-stage autoscaling and the 20.4-MiB Dict
-handoff out of Heavy L40S.
-
-The authenticated API is capped at one control container. This is deliberate: the in-process
-`_active_autoscale_profile` cache can safely suppress repeated `update_autoscaler()` calls without two
-API containers holding contradictory local views. `run_job` may scale independently because it never
-changes autoscaler policy.
-
-### Artifact retention
-
-Successful API jobs retain only final deliverables plus `validation_report.json`; heavy intermediates
-are removed by the CPU finalizer after validation. A scheduled CPU-only cleanup runs every six hours:
-
-- succeeded/unknown API jobs: 7-day retention;
-- failed jobs: 24-hour retention;
-- queued/running jobs: protected while active, but considered stale after 6 hours so an abruptly lost
-  orchestrator cannot leak storage forever;
-- `bench-*` and other non-API debug directories are never touched by the API TTL sweeper.
-
-A real CPU-only Modal regression seeded a 7-hour-old `running` `job-*` plus a `bench-*` directory. The
-scheduled cleanup deleted the stale API directory and its Dict state while preserving the benchmark
-directory. The app also successfully hydrated the authenticated ASGI endpoint. No L40S was allocated
-for these API/TTL validations.
-
-The API is therefore deliberately not a workflow framework: there is no database server, Redis,
-Celery, custom queue, user-defined DAG or extra GPU service. Modal Dict stores compact job metadata,
-Modal Volume stores artifacts, and the existing workers remain the execution graph.
-
-## Production Job API
 
 The runtime now exposes a thin, authenticated Job API rather than adding a workflow framework. It
 reuses the existing five production stages unchanged and adds only UUID job identity, status,
@@ -942,7 +917,7 @@ worker runs with `HF_HUB_OFFLINE=1`, `TRANSFORMERS_OFFLINE=1`, and `local_files_
 This keeps model download/network waits off paid GPU time and does not force Image→3D-only users to
 preload the text model.
 
-The API adds `POST /text-jobs` while preserving the existing `POST /jobs` Image→3D contract. The
+The historical HTTP API added `POST /text-jobs`; the current direct control plane exposes the same flow through `generate_text3d()` and reuses the existing Image→3D stages. The
 Text→Image stage writes the generated PNG to the existing `input_image` job slot, after which all
 five validated Image→3D stages are reused unchanged. Prompt length is capped at 1,000 characters and
 seed at integer `0..100000`.
@@ -1036,7 +1011,7 @@ regenerating geometry. The v1 API deliberately does not accept arbitrary externa
 reuses already validated assets and their existing result/retention/security model:
 
 ```text
-POST /jobs/{source_job_id}/retexture
+historical POST /jobs/{source_job_id}/retexture
         │
         ├── prompt + seed
         └── source job must be succeeded

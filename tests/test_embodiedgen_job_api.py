@@ -5,6 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 RUNTIME = ROOT / "runtime" / "embodiedgen_v2_l40s.py"
+DIRECT = ROOT / "runtime" / "embodiedgen_direct.py"
 spec = importlib.util.spec_from_file_location("embodiedgen_job_api", RUNTIME)
 runtime = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(runtime)
@@ -135,22 +136,19 @@ class TextJobTest(unittest.TestCase):
         self.assertIn('TRANSFORMERS_OFFLINE', body)
 
     def test_text_stage_runs_before_rembg(self):
-        source = RUNTIME.read_text(encoding="utf-8")
-        start = source.index("def run_job(")
-        end = source.index("@app.function(", start)
+        source = DIRECT.read_text(encoding="utf-8")
+        start = source.index("def generate_text3d(")
+        end = source.index("def retexture(", start)
         body = source[start:end]
         self.assertLess(body.index('"text2image"'), body.index('"rembg"'))
-
-    def test_text_submit_uses_async_modal_interfaces(self):
-        source = RUNTIME.read_text(encoding="utf-8")
-        start = source.index("    async def submit_text_job(")
-        end = source.index('    @web.get("/jobs/{job_id}")', start)
-        submit = source[start:end]
-        for blocking in ("artifacts.commit()", "job_states.put(", "run_job.spawn("):
-            self.assertNotIn(blocking, submit)
-        for async_call in ("artifacts.commit.aio()", "job_states.put.aio(", "run_job.spawn.aio("):
-            self.assertIn(async_call, submit)
-
+        self.assertLess(body.index('"rembg"'), body.index('"sam3d"'))
+    def test_text_path_has_no_modal_submit_orchestrator(self):
+        runtime_source = RUNTIME.read_text(encoding="utf-8")
+        direct_source = DIRECT.read_text(encoding="utf-8")
+        self.assertNotIn("def run_job(", runtime_source)
+        self.assertNotIn("def job_api(", runtime_source)
+        self.assertIn('modal.Cls.from_name(APP_NAME, "Text2ImageWorker")', direct_source)
+        self.assertIn('text.generate.remote(job_id, prompt, seed)', direct_source)
 
 class AutoscaleDedupeTest(unittest.TestCase):
     class FakeTarget:
@@ -202,17 +200,15 @@ class RetextureJobTest(unittest.TestCase):
         self.assertIn('np.allclose(src_mesh.bounds,objm.bounds', body)
         self.assertIn('len(src_mesh.faces)==len(objm.faces)', body)
 
-    def test_retexture_endpoint_requires_succeeded_source_and_async_spawn(self):
-        source = RUNTIME.read_text(encoding="utf-8")
-        start = source.index('    async def submit_retexture_job(')
-        end = source.index('    @web.get("/jobs/{job_id}")', start)
+    def test_retexture_is_direct_from_local_control_plane(self):
+        source = DIRECT.read_text(encoding="utf-8")
+        start = source.index("def retexture(")
+        end = source.index("def normalize_affordance_options(", start)
         body = source[start:end]
-        self.assertIn('source_state.get("status") != "succeeded"', body)
-        self.assertIn('await job_states.get.aio(', body)
-        self.assertIn('await job_states.put.aio(', body)
-        self.assertIn('await run_retexture_job.spawn.aio(', body)
-        self.assertNotIn('run_retexture_job.spawn(', body)
-
+        self.assertIn('source.get("status") != "succeeded"', body)
+        self.assertIn('modal.Cls.from_name(APP_NAME, "RetextureWorker")', body)
+        self.assertIn('worker.generate.remote(job_id, source_job_id, prompt, seed)', body)
+        self.assertNotIn("spawn(", body)
 
 class AffordanceJobTest(unittest.TestCase):
     def test_affordance_options_are_strict_and_defaulted(self):
@@ -234,23 +230,20 @@ class AffordanceJobTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             runtime.normalize_affordance_options({"semantic": True})
 
-    def test_affordance_orchestrator_uses_separate_deployed_app_and_stage_order(self):
-        source = RUNTIME.read_text(encoding="utf-8")
+    def test_affordance_direct_control_uses_separate_apps_and_stage_order(self):
+        source = DIRECT.read_text(encoding="utf-8")
         self.assertIn('AFFORDANCE_APP_NAME = "modal-3d-embodiedgen-affordance"', source)
         self.assertIn('modal.Function.from_name(AFFORDANCE_APP_NAME, "segment_job")', source)
         self.assertIn('modal.Function.from_name(AFFORDANCE_APP_NAME, "raw_grasp_job")', source)
-        start = source.index("def run_affordance_job(")
-        end = source.index("@app.function(", start)
+        start = source.index("def generate_affordance(")
+        end = source.index("def download_result(", start)
         body = source[start:end]
         self.assertLess(body.index('"segment"'), body.index('"grasp_raw"'))
         self.assertLess(body.index('"grasp_raw"'), body.index('"finalize"'))
-        self.assertIn('AFFORDANCE_SEMANTIC_PROFILE', body)
         self.assertIn('"semantic_inputs"', body)
         self.assertIn('"semantic_annotate"', body)
-        self.assertLess(body.index('"semantic_inputs"'), body.index('"semantic_annotate"'))
-        self.assertIn('output_job_id=job_id', body)
-        self.assertIn('files=sorted(affordance_result_files(profile))', body)
-
+        self.assertIn("output_job_id=job_id", body)
+        self.assertNotIn("spawn(", body)
     def test_affordance_finalize_publishes_hash_bound_bundle(self):
         source = RUNTIME.read_text(encoding="utf-8")
         start = source.index("def finalize_affordance_bundle(")
@@ -279,24 +272,21 @@ class AffordanceJobTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             runtime.affordance_result_files("unknown")
 
-    def test_affordance_endpoint_requires_succeeded_source_and_async_dispatch(self):
-        source = RUNTIME.read_text(encoding="utf-8")
-        start = source.index('    async def submit_affordance_job(')
-        end = source.index('    @web.get("/jobs/{job_id}")', start)
-        body = source[start:end]
-        self.assertIn('source_state.get("status") != "succeeded"', body)
-        self.assertIn('await artifacts.reload.aio()', body)
-        self.assertIn('await artifacts.commit.aio()', body)
-        self.assertIn('await job_states.put.aio(', body)
-        self.assertIn('await run_affordance_job.spawn.aio(', body)
-        self.assertNotIn('run_affordance_job.spawn(', body)
-
-    def test_job_file_urls_are_scoped_to_state_file_roles(self):
-        source = RUNTIME.read_text(encoding="utf-8")
-        self.assertIn('available = state.get("files") or sorted(RESULT_FILES)', source)
-        self.assertIn('if name not in available:', source)
-        self.assertIn('ALL_RESULT_FILES[name]', source)
-
+    def test_affordance_has_no_modal_api_dispatch_layer(self):
+        runtime_source = RUNTIME.read_text(encoding="utf-8")
+        direct_source = DIRECT.read_text(encoding="utf-8")
+        self.assertNotIn("def run_affordance_job(", runtime_source)
+        self.assertNotIn("@modal.asgi_app", runtime_source)
+        self.assertIn("def generate_affordance(", direct_source)
+        self.assertIn("_put_job(", direct_source)
+    def test_direct_download_is_scoped_to_state_file_roles(self):
+        source = DIRECT.read_text(encoding="utf-8")
+        start = source.index("def download_result(")
+        body = source[start:]
+        self.assertIn('state.get("files")', body)
+        self.assertIn("RESULT_FILES", body)
+        self.assertIn("AFFORDANCE_RESULT_FILES", body)
+        self.assertIn("_artifacts().read_file(remote)", body)
 
 class AffordanceSemanticInputTest(unittest.TestCase):
     def test_semantic_parts_are_bound_to_persisted_provider_palette(self):
@@ -451,16 +441,15 @@ class RuntimeIsolationTest(unittest.TestCase):
             self.assertIn("image=cpu_image", decorator, marker)
         self.assertIn("image=image,\n    gpu=\"L40S\"", source)
 
-    def test_async_submit_uses_only_modal_aio_interfaces(self):
-        source = RUNTIME.read_text(encoding="utf-8")
-        start = source.index("    async def submit_job(")
-        end = source.index("    @web.get(\"/jobs/{job_id}\")", start)
-        submit = source[start:end]
-        for blocking in ("artifacts.commit()", "job_states.put(", "run_job.spawn("):
-            self.assertNotIn(blocking, submit)
-        for async_call in ("artifacts.commit.aio()", "job_states.put.aio(", "run_job.spawn.aio("):
-            self.assertIn(async_call, submit)
-
+    def test_production_hot_path_has_no_modal_api_orchestrator(self):
+        runtime_source = RUNTIME.read_text(encoding="utf-8")
+        direct_source = DIRECT.read_text(encoding="utf-8")
+        for forbidden in ("def job_api(", "def run_job(", "def run_retexture_job(", "def run_affordance_job("):
+            self.assertNotIn(forbidden, runtime_source)
+        self.assertNotIn("@modal.asgi_app", runtime_source)
+        self.assertIn("batch_upload", direct_source)
+        self.assertIn('modal.Cls.from_name(APP_NAME, "RembgWorker")', direct_source)
+        self.assertIn('modal.Cls.from_name(APP_NAME, "Sam3DWorker")', direct_source)
     def test_benchmark_fallback_is_preloaded_not_source_checkout(self):
         source = RUNTIME.read_text(encoding="utf-8")
         self.assertIn('/weights/examples/sample_00.jpg', source)

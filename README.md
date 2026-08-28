@@ -25,7 +25,8 @@ patches/                     source/runtime compatibility overlays
         legacy/              historical experiments kept for reproduction only
 
 runtime/                     deployable Modal applications
-    embodiedgen_v2_l40s.py   current EmbodiedGen Image→3D / Text→3D / Retexture runtime/API
+    embodiedgen_v2_l40s.py   current EmbodiedGen compute workers
+    embodiedgen_direct.py     local/VPS control plane; direct calls to deployed workers
     legacy/                  historical runtime variants
 ```
 
@@ -47,7 +48,7 @@ runtime/embodiedgen_v2_l40s.py
         ├── clone exact upstream EmbodiedGen commit
         ├── verify/download the prebuilt Release artifacts
         ├── apply patches/embodiedgen-v2.0.0/production/*
-        └── deploy the Modal production workers/API
+        └── deploy only the Modal production compute workers
 ```
 
 `modal_build/embodiedgen.py` intentionally does **not** import or execute files from `patches/`:
@@ -57,16 +58,12 @@ artifacts and applies runtime compatibility patches in a later image-build stage
 The milestone tag `embodiedgen-v2.0.0-image-to-3d-modal-v1` marks completion of the validated
 Image→3D production pipeline. It is a Git tag only, not a GitHub Release.
 
-The production EmbodiedGen API now also exposes `POST /text-jobs`: a pinned public Kolors
-Text→Image L40S stage generates the conditioning image and then reuses the exact validated
-Image→3D pipeline. A full authenticated production Text→3D E2E has passed with GLB/video/validation
-HTTP downloads and zero traceback/OOM/runtime-warning matches. See `docs/embodiedgen.md` for the
-pinned model revision, timings and measured cold validation cost.
-
-It also exposes `POST /jobs/{source_job_id}/retexture` for prompt-driven appearance edits of an
-existing successful asset. Retexture reuses the pinned Kolors snapshot plus only ~393 MiB of pinned
-RoboAssetGen ControlNet/RealESRGAN weights, preserves geometry, and has passed an authenticated
-production E2E with OBJ/MTL/texture/GLB/video downloads and zero GPT-init/UV/traceback/OOM warnings.
+Production request orchestration now runs in the local/VPS process via
+`runtime/embodiedgen_direct.py`. The local control plane uploads inputs with Modal Volume APIs,
+updates autoscalers through the Modal control plane, and calls `RembgWorker`, `Sam3DWorker`,
+`MeshWorker`, `lite_gpu_bake`, `cpu_finalize`, Text2Image, Retexture, and Affordance workers directly.
+There is no Modal ASGI gateway and no `run_job`/retexture/affordance orchestration Function in the
+request hot path, so a request does not pay a separate control-container cold start before compute.
 
 ## TRELLIS2 / L40S
 
