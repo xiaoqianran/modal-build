@@ -18,14 +18,6 @@ repository-wide lifecycle folders.
 
 ```text
 integrations/
-    embodiedgen/
-        build/                  release/build helpers
-        runtime/                deployed workers + local/VPS direct control plane
-        env/                    pinned environment manifest
-        patches/                production and historical compatibility patches
-        tests/                  EmbodiedGen-specific tests
-        README.md               integration documentation
-
     fastsam3d/
         build/
         env/
@@ -48,35 +40,9 @@ shared/                         reserved for genuinely cross-integration code
 The Hermit/TRELLIS2 builder filenames and version relationship are intentionally preserved as-is;
 this reorganization only changes their location.
 
-For EmbodiedGen, the lifecycle is now colocated under one integration:
-
-```text
-integrations/embodiedgen/build/embodiedgen.py
-        │
-        └── build binary artifacts (CPU host + nvcc, no paid GPU)
-                │
-                ▼
-        GitHub Release assets
-                │
-────────────────┼────────────────────────────────────
-                │
-                ▼
-integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py
-        │
-        ├── clone exact upstream EmbodiedGen commit
-        ├── verify/download the prebuilt Release artifacts
-        ├── apply integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/*
-        └── deploy only the Modal production compute workers
-```
-
-The builder intentionally does **not** import or execute the runtime patches: build artifacts and
-runtime compatibility remain separate lifecycle stages, but they now live under the same integration.
-
-Production request orchestration runs in the local/VPS process via
-`integrations/embodiedgen/runtime/embodiedgen_direct.py`. There is no Modal ASGI gateway or
-per-request orchestration Function in the request hot path.
-
-See `integrations/embodiedgen/README.md` for the full production and benchmark history.
+EmbodiedGen has moved to the dedicated `xiaoqianran/modal-embodiedgen` fork. Its complete Modal
+build/runtime/control-plane stack now lives under that repository's `modal/` directory. This
+repository no longer owns EmbodiedGen production code.
 
 ## TRELLIS2 / L40S
 
@@ -139,38 +105,6 @@ modal run integrations/hunyuan3d/build/hunyuan3d21_paint_v2.py::build
 The resulting bundle is stored in `modal-build-artifacts` and mirrored to the GitHub Release with
 the same tag. The production `modal-3D` Hunyuan worker consumes this bundle directly, so neither
 CUDA rasterization nor mesh inpainting is compiled during a cold image build.
-
-## EmbodiedGen v2.0.0 / L40S
-
-Environment: `embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1`
-
-- Python 3.10 / Ubuntu 22.04
-- CUDA 12.6.3
-- PyTorch 2.8.0 / torchvision 0.23.0
-- CUDA arch 8.9 (Ada / L40S)
-- PyTorch3D pinned to `75ebeeaea0908c5527e7b1e305fbc7681382db47`
-- nvdiffrast pinned to `729261d`
-- gsplat 1.5.3 O3 SM89 torch-extension cache
-- SAM3D model weights are intentionally kept outside release assets
-
-The build itself is **CPU-only**: the CUDA devel image provides `nvcc`, and
-`TORCH_CUDA_ARCH_LIST=8.9` targets L40S without renting a GPU.  A real L40S is used only for the
-end-to-end validation run.  The validated production runtime patches are under
-`integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/`, with the Modal runner under
-`integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py`. Historical patch/runtime variants are isolated under `legacy/`.
-
-Build and publish:
-
-```bash
-modal run integrations/embodiedgen/build/embodiedgen.py::build_and_release
-```
-
-The release contains both normal wheels and the precompiled torch-extension cache.  Extract the
-cache archive into `~/.cache/torch_extensions/` on an identical Python/Torch/CUDA/SM89 runtime to
-avoid rebuilding gsplat/nvdiffrast on the paid GPU worker.
-
-Validation completed with `VALIDATION_OK`: 95,004 PLY Gaussians, 516,271 OBJ vertices,
-891,420 OBJ faces, one valid GLB geometry, resolvable URDF mesh references, and a valid MP4.
 
 ## Policy
 
