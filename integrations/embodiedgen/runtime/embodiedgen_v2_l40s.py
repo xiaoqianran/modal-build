@@ -982,9 +982,9 @@ image = (
 # Apply only the validated headless/source patches after all packages are installed.
 image = (
     image
-    .add_local_file("patches/embodiedgen-v2.0.0/production/headless-l40s.patch", "/tmp/headless-l40s.patch", copy=True)
+    .add_local_file("integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/headless-l40s.patch", "/tmp/headless-l40s.patch", copy=True)
     .add_local_file(
-        "patches/embodiedgen-v2.0.0/production/retexture-lazy-delight.patch",
+        "integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/retexture-lazy-delight.patch",
         "/tmp/retexture-lazy-delight.patch",
         copy=True,
     )
@@ -1002,12 +1002,12 @@ image = (
 image = (
     image
     .add_local_file(
-        "patches/embodiedgen-v2.0.0/production/patch_nvdiffrast_init_release.py",
+        "integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/patch_nvdiffrast_init_release.py",
         "/tmp/patch_nvdiffrast_init_release.py",
         copy=True,
     )
     .add_local_file(
-        "patches/embodiedgen-v2.0.0/production/gsplat_backend_release.py",
+        "integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/gsplat_backend_release.py",
         "/usr/local/lib/python3.10/site-packages/gsplat/cuda/_backend.py",
         copy=True,
     )

@@ -5,7 +5,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
 RUNTIME = ROOT / "runtime" / "embodiedgen_v2_l40s.py"
-BUILDER = ROOT / "modal_build" / "embodiedgen.py"
+BUILDER = ROOT / "build" / "embodiedgen.py"
 
 spec = importlib.util.spec_from_file_location("embodiedgen_supply_runtime", RUNTIME)
 runtime = importlib.util.module_from_spec(spec)

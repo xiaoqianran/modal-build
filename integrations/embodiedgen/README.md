@@ -63,7 +63,7 @@ and a valid MP4.
 
 Normal inference should never run `nvcc`. A cache miss in gsplat/nvdiffrast is treated as a hard
 error rather than silently compiling on an L40S. To rebuild CUDA artifacts, use
-`modal_build/embodiedgen.py` and publish a new release tag.
+`build/embodiedgen.py` and publish a new release tag.
 
 
 ### Reproducible source and release integrity
@@ -93,7 +93,7 @@ expensive compile steps** and instructs the operator to bump `TAG`. Release uplo
 Run once; this function is CPU-only:
 
 ```bash
-modal run runtime/embodiedgen_v2_l40s.py::preload_weights
+modal run integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py::preload_weights
 ```
 
 It populates the persistent volume with SAM3D, DINOv2 and U2Net assets. The preload function is
@@ -106,7 +106,7 @@ The historical single-function/subprocess benchmark has been retired from the pr
 Use the split-runtime benchmark instead:
 
 ```bash
-modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile auto
+modal run integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py::benchmark_split --profile auto
 ```
 
 It exercises the current resident Rembg/SAM3D/Mesh workers, Dict state handoff, Lite L40S texture
@@ -158,13 +158,13 @@ traffic is intentionally dense.
 Run the CPU-only weight pull in a fresh workspace:
 
 ```bash
-modal run runtime/embodiedgen_v2_l40s.py::preload_weights
+modal run integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py::preload_weights
 ```
 
 Run the split cold/warm benchmark with the production default:
 
 ```bash
-modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile cost_first
+modal run integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py::benchmark_split --profile cost_first
 ```
 
 The benchmark accepts `min_cost`, `cost_first`, `balanced`, or `burst`. Calls are deliberately issued
@@ -599,13 +599,13 @@ Control/benchmark examples:
 
 ```bash
 # Zero-compute policy check for this app run; it records one synthetic traffic event.
-modal run runtime/embodiedgen_v2_l40s.py::autoscale_policy_check --profile auto
+modal run integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py::autoscale_policy_check --profile auto
 
 # End-to-end benchmark under automatic policy.
-modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile auto
+modal run integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py::benchmark_split --profile auto
 
 # Explicit latency-oriented override when an operator knows a dense period is coming.
-modal run runtime/embodiedgen_v2_l40s.py::benchmark_split --profile balanced
+modal run integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py::benchmark_split --profile balanced
 ```
 
 The runtime prints both the requested and selected profile plus its computed idle-tail cost before

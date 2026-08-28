@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-BUILDER = ROOT / "modal_build" / "embodiedgen_affordance.py"
+BUILDER = ROOT / "build" / "embodiedgen_affordance.py"
 spec = importlib.util.spec_from_file_location("embodiedgen_affordance_builder", BUILDER)
 builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)

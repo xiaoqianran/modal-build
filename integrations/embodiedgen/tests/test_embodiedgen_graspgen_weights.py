@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-PRELOADER = ROOT / "modal_build" / "embodiedgen_graspgen_weights.py"
+PRELOADER = ROOT / "build" / "embodiedgen_graspgen_weights.py"
 spec = importlib.util.spec_from_file_location("graspgen_weights", PRELOADER)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)

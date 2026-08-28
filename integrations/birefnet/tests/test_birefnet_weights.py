@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).parents[1]
-PRELOADER = ROOT / "modal_build" / "birefnet_weights.py"
+PRELOADER = ROOT / "build" / "birefnet_weights.py"
 spec = importlib.util.spec_from_file_location("birefnet_weights", PRELOADER)
 mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mod)

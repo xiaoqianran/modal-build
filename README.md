@@ -10,30 +10,48 @@ Each release is keyed by Python/CUDA/PyTorch/CUDA-architecture compatibility and
 - `*.sha256` — archive checksum
 
 
-## Repository layers
+## Repository layout
 
-The repository separates three different lifecycle stages. They are related, but they do not call
-each other directly at runtime:
+The repository is organized around model integrations. Build tooling, environment manifests,
+runtime code, patches, and tests for one integration stay together instead of being split across
+repository-wide lifecycle folders.
 
 ```text
-modal_build/                 offline artifact builders
-    embodiedgen.py           builds/publishes pinned wheels and CUDA extension archives
+integrations/
+    embodiedgen/
+        build/                  release/build helpers
+        runtime/                deployed workers + local/VPS direct control plane
+        env/                    pinned environment manifest
+        patches/                production and historical compatibility patches
+        tests/                  EmbodiedGen-specific tests
+        README.md               integration documentation
 
-patches/                     source/runtime compatibility overlays
-    embodiedgen-v2.0.0/
-        production/          only files consumed by the current production runtime
-        legacy/              historical experiments kept for reproduction only
+    fastsam3d/
+        build/
+        env/
 
-runtime/                     deployable Modal applications
-    embodiedgen_v2_l40s.py   current EmbodiedGen compute workers
-    embodiedgen_direct.py     local/VPS control plane; direct calls to deployed workers
-    legacy/                  historical runtime variants
+    hermit_trellis2/
+        build/
+            hermit_trellis2_plus_plus.py
+            hermit_trellis2_plus_plus_v2.py
+        env/
+        scripts/
+
+    hunyuan3d/
+    pixal3d/
+    trellis_cpp/
+    birefnet/
+
+shared/                         reserved for genuinely cross-integration code
 ```
 
-For EmbodiedGen, the lifecycle is:
+The Hermit/TRELLIS2 builder filenames and version relationship are intentionally preserved as-is;
+this reorganization only changes their location.
+
+For EmbodiedGen, the lifecycle is now colocated under one integration:
 
 ```text
-modal_build/embodiedgen.py
+integrations/embodiedgen/build/embodiedgen.py
         │
         └── build binary artifacts (CPU host + nvcc, no paid GPU)
                 │
@@ -43,27 +61,22 @@ modal_build/embodiedgen.py
 ────────────────┼────────────────────────────────────
                 │
                 ▼
-runtime/embodiedgen_v2_l40s.py
+integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py
         │
         ├── clone exact upstream EmbodiedGen commit
         ├── verify/download the prebuilt Release artifacts
-        ├── apply patches/embodiedgen-v2.0.0/production/*
+        ├── apply integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/*
         └── deploy only the Modal production compute workers
 ```
 
-`modal_build/embodiedgen.py` intentionally does **not** import or execute files from `patches/`:
-the builder produces reusable binary artifacts, while the production runtime consumes those
-artifacts and applies runtime compatibility patches in a later image-build stage.
+The builder intentionally does **not** import or execute the runtime patches: build artifacts and
+runtime compatibility remain separate lifecycle stages, but they now live under the same integration.
 
-The milestone tag `embodiedgen-v2.0.0-image-to-3d-modal-v1` marks completion of the validated
-Image→3D production pipeline. It is a Git tag only, not a GitHub Release.
+Production request orchestration runs in the local/VPS process via
+`integrations/embodiedgen/runtime/embodiedgen_direct.py`. There is no Modal ASGI gateway or
+per-request orchestration Function in the request hot path.
 
-Production request orchestration now runs in the local/VPS process via
-`runtime/embodiedgen_direct.py`. The local control plane uploads inputs with Modal Volume APIs,
-updates autoscalers through the Modal control plane, and calls `RembgWorker`, `Sam3DWorker`,
-`MeshWorker`, `lite_gpu_bake`, `cpu_finalize`, Text2Image, Retexture, and Affordance workers directly.
-There is no Modal ASGI gateway and no `run_job`/retexture/affordance orchestration Function in the
-request hot path, so a request does not pay a separate control-container cold start before compute.
+See `integrations/embodiedgen/README.md` for the full production and benchmark history.
 
 ## TRELLIS2 / L40S
 
@@ -79,7 +92,7 @@ Environment: `hermit-trellis2-plus-plus-py311-cu124-torch260-sm89-v2`
 Build and publish from Modal:
 
 ```bash
-modal run -m modal_build.hermit_trellis2_plus_plus_v2::build
+modal run integrations/hermit_trellis2/build/hermit_trellis2_plus_plus_v2.py::build
 ```
 
 The v2 builder is hard-limited to one L40S container and writes a SHA256-manifested wheel bundle to
@@ -101,7 +114,7 @@ Environment: `fastsam3d-pytorch3d-py311-cu121-torch251-sm89-v1`
 Build it with:
 
 ```bash
-modal run -m modal_build.fastsam3d_pytorch3d::build
+modal run integrations/fastsam3d/build/fastsam3d_pytorch3d.py::build
 ```
 
 The production FastSAM3D worker installs this released wheel bundle instead of compiling PyTorch3D
@@ -120,7 +133,7 @@ Environment: `hunyuan3d-2.1-paint-py311-cu124-torch251-sm89-v2`
 Build the exact runtime-native bundle:
 
 ```bash
-modal run -m modal_build.hunyuan3d21_paint_v2::build
+modal run integrations/hunyuan3d/build/hunyuan3d21_paint_v2.py::build
 ```
 
 The resulting bundle is stored in `modal-build-artifacts` and mirrored to the GitHub Release with
@@ -143,13 +156,13 @@ Environment: `embodiedgen-v2.0.0-py310-cu126-torch280-sm89-v1`
 The build itself is **CPU-only**: the CUDA devel image provides `nvcc`, and
 `TORCH_CUDA_ARCH_LIST=8.9` targets L40S without renting a GPU.  A real L40S is used only for the
 end-to-end validation run.  The validated production runtime patches are under
-`patches/embodiedgen-v2.0.0/production/`, with the Modal runner under
-`runtime/embodiedgen_v2_l40s.py`. Historical patch/runtime variants are isolated under `legacy/`.
+`integrations/embodiedgen/patches/embodiedgen-v2.0.0/production/`, with the Modal runner under
+`integrations/embodiedgen/runtime/embodiedgen_v2_l40s.py`. Historical patch/runtime variants are isolated under `legacy/`.
 
 Build and publish:
 
 ```bash
-modal run -m modal_build.embodiedgen::build_and_release
+modal run integrations/embodiedgen/build/embodiedgen.py::build_and_release
 ```
 
 The release contains both normal wheels and the precompiled torch-extension cache.  Extract the
