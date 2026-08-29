@@ -114,7 +114,12 @@ def build() -> dict:
 
     nerfview = Path("/tmp/nerfview")
     clone("https://github.com/nerfstudio-project/nerfview.git", nerfview, NERFVIEW_REVISION)
-    copy_license(nerfview, "nerfview-LICENSE.txt")
+    (LICENSES / "nerfview-LICENSE-NOTICE.txt").write_text(
+        "Pinned nerfview revision 4538024fe0d15fd1a0e4d760f3695fc44ca72787 "
+        'declares license = { text = "MIT" } and the MIT classifier in pyproject.toml, '
+        "but that revision does not contain a standalone LICENSE file. This artifact is therefore "
+        "kept out of public GitHub Releases.\n"
+    )
     sh(f"{sys.executable} -m pip wheel . --no-deps -w {WHEELS}", cwd=nerfview)
 
     moge = Path("/tmp/MoGe")
@@ -128,10 +133,14 @@ def build() -> dict:
     manifest = {
         "tag": TAG,
         "bundle_kind": "hyworld2-oss-source-wheels",
-        "public_release": True,
+        "public_release": False,
         "python": PYTHON,
         "artifacts": [
-            {"name": "nerfview", "revision": NERFVIEW_REVISION, "license": "Apache-2.0"},
+            {
+                "name": "nerfview",
+                "revision": NERFVIEW_REVISION,
+                "license": "MIT metadata; no LICENSE file at pinned revision",
+            },
             {"name": "MoGe", "revision": MOGE_REVISION, "license": "MIT/Apache-2.0"},
         ],
         "wheels": wheel_records(WHEELS, {"nerfview-": "nerfview", "moge-": "MoGe"}),

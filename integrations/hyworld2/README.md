@@ -18,7 +18,7 @@ revision, ABI, license files and SHA256 manifest.
 | --- | --- | --- |
 | `hyworld2-hy-native-...` | custom gsplat + HY navmesh binding | Modal Volume only |
 | `hyworld2-oss-native-...` | PyTorch3D + fused-ssim + SPZ | Volume + GitHub Release |
-| `hyworld2-oss-source-...` | MoGe + nerfview | Volume + GitHub Release |
+| `hyworld2-oss-source-...` | MoGe + pinned nerfview | Modal Volume only (nerfview pinned revision lacks LICENSE file) |
 | `hyworld2-flash-attn-...` | FlashAttention sm_120 | Volume + GitHub Release after smoke |
 
 FlashAttention is optional: upstream HYWorld2 falls back to PyTorch SDPA when neither FA3 nor FA2
