@@ -9,7 +9,8 @@
   "upstream": {
     "repository": "Tencent-Hunyuan/HY-World-2.0",
     "revision": "df9988efb87bfc0f4947eb3889411cf957478b06",
-    "recastnavigation_revision": "9f4ce64458dfae86e1239c525ddc219c4e9e06f1"
+    "recastnavigation_revision": "9f4ce64458dfae86e1239c525ddc219c4e9e06f1",
+    "gsplat_glm_revision": "33b4a621a697a305bc3a7610d290677b96beb181"
   },
   "bundles": {
     "restricted_native": "hyworld2-hy-native-py311-cu128-torch271-sm120-v1",

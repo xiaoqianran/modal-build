@@ -87,6 +87,7 @@ TAG = "hyworld2-hy-native-py311-cu128-torch271-sm120-v1"
 HY_REPO = "https://github.com/Tencent-Hunyuan/HY-World-2.0.git"
 HY_REVISION = "df9988efb87bfc0f4947eb3889411cf957478b06"
 RECAST_REVISION = "9f4ce64458dfae86e1239c525ddc219c4e9e06f1"
+GLM_REVISION = "33b4a621a697a305bc3a7610d290677b96beb181"
 PYTHON, CUDA, TORCH, TORCHVISION = "3.11", "12.8.1", "2.7.1", "0.22.1"
 CUDA_ARCH, GPU = "12.0", "RTX-PRO-6000"
 WHEELS, LICENSES, OUT = Path("/tmp/wheels"), Path("/tmp/licenses"), Path("/out")
@@ -184,6 +185,9 @@ def build() -> dict:
     )
 
     gsplat_dir = src / "hyworld2/worldgen/third_party/gsplat_maskgaussian"
+    glm_dir = gsplat_dir / "gsplat/cuda/csrc/third_party/glm"
+    clone("https://github.com/g-truc/glm.git", glm_dir, GLM_REVISION)
+    shutil.copy2(glm_dir / "copying.txt", LICENSES / "GLM-copying.txt")
     (gsplat_dir / "gsplat/version.py").write_text(
         f'__version__ = "1.5.3+hyworld2.{HY_REVISION[:8]}.sm120"\n'
     )
@@ -225,6 +229,7 @@ def build() -> dict:
         "source": "Tencent-Hunyuan/HY-World-2.0",
         "source_revision": HY_REVISION,
         "recast_revision": RECAST_REVISION,
+        "glm_revision": GLM_REVISION,
         "wheels": wheel_records(
             WHEELS, {"gsplat-": "hyworld2-gsplat-maskgaussian", "recast-": "hyworld2-navmesh"}
         ),
