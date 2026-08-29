@@ -1,0 +1,67 @@
+name: HYWorld2 Build Artifact
+
+on:
+  workflow_dispatch:
+    inputs:
+      bundle:
+        description: Artifact bundle to build
+        type: choice
+        required: true
+        options:
+          - hy-private
+          - oss-native
+          - oss-source
+          - flash-attn
+      publish:
+        description: Publish to GitHub Release when manifest permits it
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.11"
+      - name: Install Modal CLI
+        run: uv tool install 'modal>=1.5,<2'
+      - name: Resolve builder and tag
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          case '${{ inputs.bundle }}' in
+            hy-private)
+              echo 'builder=integrations/hyworld2/build/hyworld2_hy_native_sm120.py::build' >> "$GITHUB_OUTPUT"
+              echo 'tag=hyworld2-hy-native-py311-cu128-torch271-sm120-v1' >> "$GITHUB_OUTPUT"
+              ;;
+            oss-native)
+              echo 'builder=integrations/hyworld2/build/hyworld2_oss_native_sm120.py::build' >> "$GITHUB_OUTPUT"
+              echo 'tag=hyworld2-oss-native-py311-cu128-torch271-sm120-v1' >> "$GITHUB_OUTPUT"
+              ;;
+            oss-source)
+              echo 'builder=integrations/hyworld2/build/hyworld2_oss_source_wheels.py::build' >> "$GITHUB_OUTPUT"
+              echo 'tag=hyworld2-oss-source-py311-v1' >> "$GITHUB_OUTPUT"
+              ;;
+            flash-attn)
+              echo 'builder=integrations/hyworld2/build/hyworld2_flash_attn_sm120.py::build' >> "$GITHUB_OUTPUT"
+              echo 'tag=hyworld2-flash-attn-py311-cu128-torch271-sm120-v1' >> "$GITHUB_OUTPUT"
+              ;;
+          esac
+      - name: Build and smoke on Modal
+        run: modal run '${{ steps.meta.outputs.builder }}'
+      - name: Publish allowed bundle
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: integrations/hyworld2/scripts/publish_from_volume.sh '${{ steps.meta.outputs.tag }}'

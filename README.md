@@ -106,6 +106,14 @@ The resulting bundle is stored in `modal-build-artifacts` and mirrored to the Gi
 the same tag. The production `modal-3D` Hunyuan worker consumes this bundle directly, so neither
 CUDA rasterization nor mesh inpainting is compiled during a cold image build.
 
+## HY-World 2.0 / RTX PRO 6000 Blackwell
+
+HYWorld2 build recipes live under `integrations/hyworld2/`. ABI-sensitive CUDA/C++ dependencies are
+prebuilt for Python 3.11 / CUDA 12.8 / PyTorch 2.7.1 / sm_120. HY-WORLD-derived native binaries
+(custom gsplat and the navmesh binding) are cached in Modal Volume only because the HY-WORLD
+Community License has Territory restrictions; permissively licensed third-party wheels are eligible
+for SHA256-manifested GitHub Releases. Model weights are never Release assets.
+
 ## Policy
 
 Do not publish model weights, gated Hugging Face assets, secrets, or artifacts without clear

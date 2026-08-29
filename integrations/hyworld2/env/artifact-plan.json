@@ -1,0 +1,14 @@
+{
+  "runtime": "HY-World 2.0 / WorldMirror 2.0 / WorldStereo 2.0",
+  "artifacts": [
+    {"name": "HY-World gsplat_maskgaussian", "kind": "CUDA extension", "priority": "required", "cache": "Modal Volume", "github_release": false, "reason": "HY-WORLD-derived custom fork; Territory-restricted license."},
+    {"name": "HY-World recast navmesh binding", "kind": "C++/pybind11 extension", "priority": "required for worldgen", "cache": "Modal Volume", "github_release": false, "reason": "Binding source is HY-WORLD-derived; keep private."},
+    {"name": "PyTorch3D", "kind": "CUDA/C++ extension", "priority": "required for point rendering", "cache": "Modal Volume + GitHub Release", "github_release": true, "revision": "75ebeeaea0908c5527e7b1e305fbc7681382db47"},
+    {"name": "fused-ssim", "kind": "CUDA extension", "priority": "required for 3DGS training", "cache": "Modal Volume + GitHub Release", "github_release": true, "revision": "328dc9836f513d00c4b5bc38fe30478b4435cbb5"},
+    {"name": "SPZ", "kind": "native extension", "priority": "required for .spz export when enabled", "cache": "Modal Volume + GitHub Release", "github_release": true, "revision": "5bf2945de1a003cee07133b1e495fe9c6ffdc7e7"},
+    {"name": "FlashAttention", "kind": "CUDA extension", "priority": "optional acceleration", "cache": "Modal Volume + GitHub Release after sm_120 smoke", "github_release": true, "experimental": true, "revision": "ce088ab9ce0fc0434dcd8afa0a791da9fcc3a820", "fallback": "PyTorch SDPA"},
+    {"name": "MoGe", "kind": "Git Python package", "priority": "required for depth/normal", "cache": "GitHub Release wheel", "github_release": true, "revision": "0286b495230a074aadf1c76cc5c679e943e5d1c6"},
+    {"name": "nerfview", "kind": "Git Python package", "priority": "GS viewer utility", "cache": "GitHub Release wheel", "github_release": true, "revision": "4538024fe0d15fd1a0e4d760f3695fc44ca72787"},
+    {"name": "Model checkpoints", "kind": "weights", "priority": "runtime", "cache": "Modal Volume / pinned Hugging Face", "github_release": false, "reason": "Weights are outside binary build artifact policy."}
+  ]
+}
