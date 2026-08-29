@@ -122,6 +122,8 @@ def build() -> dict:
     env.update(
         {
             "CUDA_HOME": "/usr/local/cuda",
+            "CC": "gcc",
+            "CXX": "g++",
             "TORCH_CUDA_ARCH_LIST": CUDA_ARCH,
             "FLASH_ATTN_CUDA_ARCHS": "120",
             "MAX_JOBS": "4",

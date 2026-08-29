@@ -107,6 +107,8 @@ def build_env() -> dict[str, str]:
     env.update(
         {
             "CUDA_HOME": "/usr/local/cuda",
+            "CC": "gcc",
+            "CXX": "g++",
             "FORCE_CUDA": "1",
             "TORCH_CUDA_ARCH_LIST": CUDA_ARCH,
             "MAX_JOBS": "4",
