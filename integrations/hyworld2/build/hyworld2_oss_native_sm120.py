@@ -94,10 +94,13 @@ app = modal.App("modal-build-hyworld2-oss-native-sm120")
 artifacts = modal.Volume.from_name(ARTIFACT_VOLUME, create_if_missing=True)
 image = (
     modal.Image.from_registry(f"nvidia/cuda:{CUDA}-devel-ubuntu22.04", add_python=PYTHON)
-    .apt_install("git", "build-essential", "cmake", "ninja-build", "pkg-config")
+    .apt_install(
+        "git", "build-essential", "cmake", "ninja-build", "pkg-config", "zlib1g-dev", "libzstd-dev"
+    )
     .run_commands(
-        "python -m pip install --upgrade pip setuptools wheel packaging ninja cmake scikit-build-core pybind11",
+        "python -m pip install --upgrade pip setuptools wheel packaging ninja cmake scikit-build-core pybind11 nanobind python_devtools",
         f"python -m pip install torch=={TORCH} torchvision=={TORCHVISION} --index-url https://download.pytorch.org/whl/cu128",
+        "python -m pip install --force-reinstall numpy==1.26.4",
     )
 )
 
