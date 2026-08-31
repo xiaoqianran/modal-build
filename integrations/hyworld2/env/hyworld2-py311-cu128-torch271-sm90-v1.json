@@ -1,0 +1,21 @@
+{
+  "family": "hyworld2",
+  "python": "3.11",
+  "cuda": "12.8.1",
+  "torch": "2.7.1",
+  "torchvision": "0.22.1",
+  "cuda_arch": "9.0",
+  "target_gpu": "H100",
+  "upstream": {
+    "repository": "Tencent-Hunyuan/HY-World-2.0",
+    "revision": "df9988efb87bfc0f4947eb3889411cf957478b06",
+    "recastnavigation_revision": "9f4ce64458dfae86e1239c525ddc219c4e9e06f1",
+    "gsplat_glm_revision": "33b4a621a697a305bc3a7610d290677b96beb181"
+  },
+  "bundles": {
+    "restricted_native": "hyworld2-hy-native-py311-cu128-torch271-sm90-v1",
+    "oss_native": "hyworld2-oss-native-py311-cu128-torch271-sm90-v1",
+    "oss_source": "hyworld2-oss-source-py311-v1",
+    "flash_attention": "hyworld2-flash-attn-py311-cu128-torch271-sm90-v1"
+  }
+}

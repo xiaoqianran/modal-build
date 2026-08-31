@@ -12,6 +12,14 @@ on:
           - oss-native
           - oss-source
           - flash-attn
+      arch:
+        description: Native CUDA architecture
+        type: choice
+        required: true
+        default: sm120
+        options:
+          - sm120
+          - sm90
       publish:
         description: Publish to GitHub Release when manifest permits it
         type: boolean
@@ -40,22 +48,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          arch='${{ inputs.arch }}'
           case '${{ inputs.bundle }}' in
             hy-private)
-              echo 'builder=integrations/hyworld2/build/hyworld2_hy_native_sm120.py::build' >> "$GITHUB_OUTPUT"
-              echo 'tag=hyworld2-hy-native-py311-cu128-torch271-sm120-v1' >> "$GITHUB_OUTPUT"
+              echo "builder=integrations/hyworld2/build/hyworld2_hy_native_${arch}.py::build" >> "$GITHUB_OUTPUT"
+              echo "tag=hyworld2-hy-native-py311-cu128-torch271-${arch}-v1" >> "$GITHUB_OUTPUT"
               ;;
             oss-native)
-              echo 'builder=integrations/hyworld2/build/hyworld2_oss_native_sm120.py::build' >> "$GITHUB_OUTPUT"
-              echo 'tag=hyworld2-oss-native-py311-cu128-torch271-sm120-v1' >> "$GITHUB_OUTPUT"
+              echo "builder=integrations/hyworld2/build/hyworld2_oss_native_${arch}.py::build" >> "$GITHUB_OUTPUT"
+              echo "tag=hyworld2-oss-native-py311-cu128-torch271-${arch}-v1" >> "$GITHUB_OUTPUT"
               ;;
             oss-source)
               echo 'builder=integrations/hyworld2/build/hyworld2_oss_source_wheels.py::build' >> "$GITHUB_OUTPUT"
               echo 'tag=hyworld2-oss-source-py311-v1' >> "$GITHUB_OUTPUT"
               ;;
             flash-attn)
-              echo 'builder=integrations/hyworld2/build/hyworld2_flash_attn_sm120.py::build' >> "$GITHUB_OUTPUT"
-              echo 'tag=hyworld2-flash-attn-py311-cu128-torch271-sm120-v1' >> "$GITHUB_OUTPUT"
+              echo "builder=integrations/hyworld2/build/hyworld2_flash_attn_${arch}.py::build" >> "$GITHUB_OUTPUT"
+              echo "tag=hyworld2-flash-attn-py311-cu128-torch271-${arch}-v1" >> "$GITHUB_OUTPUT"
               ;;
           esac
       - name: Build and smoke on Modal

@@ -1,8 +1,9 @@
 # HY-World 2.0 build artifacts
 
 This integration prepares reproducible artifacts for the future `modal-provider/modal-world`
-HYWorld2 backend. The primary Blackwell ABI is Python 3.11 + CUDA 12.8 + PyTorch 2.7.1 on Modal
-`RTX-PRO-6000` (`sm_120`).
+HYWorld2 backend. Native CUDA bundles are architecture-specific while keeping one runtime ABI:
+Python 3.11 + CUDA 12.8 + PyTorch 2.7.1. Supported targets are Modal `RTX-PRO-6000`
+(`sm_120`) and `H100` (`sm_90`).
 
 ## Artifact split
 
@@ -19,7 +20,7 @@ revision, ABI, license files and SHA256 manifest.
 | `hyworld2-hy-native-...` | custom gsplat + HY navmesh binding | Modal Volume only |
 | `hyworld2-oss-native-...` | PyTorch3D + fused-ssim + SPZ | Volume + GitHub Release |
 | `hyworld2-oss-source-...` | MoGe + pinned nerfview | Modal Volume only (nerfview pinned revision lacks LICENSE file) |
-| `hyworld2-flash-attn-...` | FlashAttention sm_120 | Volume + GitHub Release after smoke |
+| `hyworld2-flash-attn-...` | FlashAttention, architecture-specific | Volume + GitHub Release after smoke |
 
 FlashAttention is optional: upstream HYWorld2 falls back to PyTorch SDPA when neither FA3 nor FA2
 is available. The base runtime therefore must not depend on FlashAttention succeeding.
@@ -31,11 +32,17 @@ modal run integrations/hyworld2/build/hyworld2_hy_native_sm120.py::build
 modal run integrations/hyworld2/build/hyworld2_oss_native_sm120.py::build
 modal run integrations/hyworld2/build/hyworld2_oss_source_wheels.py::build
 modal run integrations/hyworld2/build/hyworld2_flash_attn_sm120.py::build
+
+# H100 / Hopper
+modal run integrations/hyworld2/build/hyworld2_hy_native_sm90.py::build
+modal run integrations/hyworld2/build/hyworld2_oss_native_sm90.py::build
+modal run integrations/hyworld2/build/hyworld2_flash_attn_sm90.py::build
 ```
 
-GPU builders check for compute capability `(12, 0)`. The restricted gsplat builder executes a real
-CUDA rasterization using the HY-only `distloss` and `gauss_masks` arguments. The OSS builder runs a
-PyTorch3D CUDA KNN and fused-ssim CUDA smoke.
+GPU builders fail closed on the expected compute capability: `(12, 0)` for Blackwell and `(9, 0)`
+for Hopper. The restricted gsplat builder executes a real CUDA rasterization using the HY-only
+`distloss` and `gauss_masks` arguments. The OSS builder runs a PyTorch3D CUDA KNN and fused-ssim CUDA
+smoke.
 
 Each build writes to `modal-build-artifacts`:
 
