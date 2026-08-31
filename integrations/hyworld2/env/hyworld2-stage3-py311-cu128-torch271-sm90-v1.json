@@ -1,0 +1,23 @@
+{
+  "family": "hyworld2-stage3",
+  "python": "3.11",
+  "cuda": "12.8.1",
+  "torch": "2.7.1",
+  "torchvision": "0.22.1",
+  "cuda_arch": "9.0",
+  "target_gpu": "H100",
+  "upstream": {
+    "repository": "Tencent-Hunyuan/HY-World-2.0",
+    "revision": "df9988efb87bfc0f4947eb3889411cf957478b06",
+    "pytorch3d_revision": "75ebeeaea0908c5527e7b1e305fbc7681382db47",
+    "gsplat_revision": "937e29912570c372bed6747a5c9bf85fed877bae"
+  },
+  "bundles": {
+    "stage3_native": "hyworld2-stage3-native-py311-cu128-torch271-sm90-v1",
+    "oss_source": "hyworld2-oss-source-py311-v1"
+  },
+  "attention": {
+    "default": "torch-sdpa",
+    "flash_attention": "optional"
+  }
+}
