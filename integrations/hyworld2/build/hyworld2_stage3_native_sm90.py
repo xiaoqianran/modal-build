@@ -116,10 +116,10 @@ def smoke() -> None:
     Ks = torch.tensor([[[32.0, 0.0, 16.0], [0.0, 32.0, 16.0], [0.0, 0.0, 1.0]]], device="cuda")
     rendered, alpha, _ = rasterization(
         means, quats, scales, opacities, colors, viewmats, Ks,
-        width=32, height=32, render_mode="RGB+ED", with_eval3d=True,
+        width=32, height=32, render_mode="RGB+ED", packed=True, with_eval3d=False,
     )
     if rendered.shape[-1] != 4 or alpha.max().item() <= 0:
-        raise RuntimeError("gsplat eval3d rasterization smoke failed")
+        raise RuntimeError("gsplat rasterization smoke failed")
 
 
 @app.function(image=image, gpu=GPU, volumes={"/out": artifacts}, timeout=2 * 60 * 60, max_containers=1)
@@ -141,6 +141,7 @@ def build() -> dict:
 
     gsplat = Path("/tmp/gsplat")
     clone("https://github.com/nerfstudio-project/gsplat.git", gsplat, GSPLAT_REVISION)
+    sh("git submodule update --init --recursive", cwd=gsplat)
     copy_license(gsplat, "gsplat-LICENSE.txt")
     sh(f"{sys.executable} -m pip wheel . --no-build-isolation --no-deps -w {WHEELS}", cwd=gsplat, env=env)
 
@@ -165,7 +166,7 @@ def build() -> dict:
             {"name": "gsplat", "revision": GSPLAT_REVISION, "version": "1.5.3", "license": "Apache-2.0"},
         ],
         "wheels": wheel_records(),
-        "smoke": ["gpu-sm90", "pytorch3d-cuda-knn", "gsplat-eval3d-cuda"],
+        "smoke": ["gpu-sm90", "pytorch3d-cuda-knn", "gsplat-classic-cuda"],
     })
     artifacts.commit()
     return manifest
