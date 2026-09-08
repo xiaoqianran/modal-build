@@ -47,6 +47,16 @@ class HYWorld2ArtifactPlanTest(unittest.TestCase):
         self.assertIn("manifest public_release=false", source)
         self.assertIn("exit 3", source)
 
+    def test_comfyui_runtime_records_incompatible_release_abi(self):
+        env = json.loads(
+            (ROOT / "env/hyworld2-comfyui-py312-cu130-torch291-sm120-v1.json").read_text()
+        )
+        self.assertEqual(env["target_gpu"], "RTX-PRO-6000")
+        self.assertEqual(env["cuda_arch"], "12.0")
+        self.assertFalse(
+            env["artifact_compatibility"]["hyworld2-py311-cu128-torch271-sm120-v1"]
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

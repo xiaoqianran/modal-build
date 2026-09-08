@@ -2,12 +2,20 @@ import os
 import pathlib
 import shutil
 import subprocess
+import time
+import urllib.request
 
 import modal
 
-APP_NAME = "comfyui-hyworld2"
-GPU = os.environ.get("MODAL_GPU", "H100")
-CUDA_ARCH = {"H100": "9.0", "H200": "9.0", "A100": "8.0", "A10G": "8.6", "L40S": "8.9", "L4": "8.9"}.get(GPU)
+from modal_config import (
+    APP_NAME,
+    CUDA_ARCH,
+    GPU,
+    MAX_SESSION_SECONDS,
+    SCALEDOWN_WINDOW_SECONDS,
+)
+
+LOCAL_DIR = pathlib.Path(__file__).parent
 COMFYUI_DIR = pathlib.Path("/opt/ComfyUI")
 DATA_DIR = pathlib.Path("/data")
 PORT = 8188
@@ -76,7 +84,7 @@ image = (
         "python -c \"import recast; print('recast import OK')\"",
     )
     .add_local_file(
-        "/workspace/hyworld2-modal/pytorch3d_nopulsar_build.py",
+        LOCAL_DIR / "pytorch3d_nopulsar_build.py",
         "/opt/pytorch3d_nopulsar_build.py",
         copy=True,
     )
@@ -109,7 +117,7 @@ image = (
         "PY_DEP_CHECK",
     )
     .add_local_file(
-        "/workspace/hyworld2-modal/runtime_patch.py",
+        LOCAL_DIR / "runtime_patch.py",
         "/opt/runtime_patch.py",
         copy=True,
     )
@@ -124,16 +132,35 @@ image = (
         "print('WorldStereo import smoke OK', WorldStereo)\n"
         "PY_WS_IMPORT",
     )
+    .run_commands(
+        "python -m pip install 'scikit-image' 'easydict'",
+        "python -m pip check",
+        "python - <<'PY_WORLDGEN_IMPORT'\n"
+        "import sys\n"
+        "sys.path.insert(0, '/opt/ComfyUI/custom_nodes/ComfyUI_HYWorld2')\n"
+        "import hyworld2.worldgen.traj_generate\n"
+        "print('HYWorld2 worldgen traj_generate import OK')\n"
+        "PY_WORLDGEN_IMPORT",
+    )
     .add_local_file(
-        "/workspace/hyworld2-modal/video_output_node.py",
+        LOCAL_DIR / "video_output_node.py",
         "/opt/ComfyUI/custom_nodes/HYWorld2_Modal_Video/__init__.py",
         copy=True,
     )
+    .add_local_file(LOCAL_DIR / "modal_config.py", "/root/modal_config.py", copy=True)
+    .add_local_file(LOCAL_DIR / "world_runner.py", "/root/world_runner.py", copy=True)
 )
 
 
 
-@app.function(image=image, gpu=GPU, timeout=60 * 60)
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=30 * 60,
+    min_containers=0,
+    scaledown_window=60,
+    max_containers=1,
+)
 def build_probe():
     import torch
     import gsplat
@@ -141,8 +168,8 @@ def build_probe():
     import recast
     import pytorch3d
     return {
-        "torch": torch.__version__,
-        "cuda": torch.version.cuda,
+        "torch": str(torch.__version__),
+        "cuda": str(torch.version.cuda),
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "native_modules": ["gsplat", "fused_ssim", "recast", "pytorch3d"],
     }
@@ -169,8 +196,9 @@ def _persist_dir(name: str) -> None:
     image=image,
     gpu=GPU,
     volumes={"/data": data_volume},
-    timeout=24 * 60 * 60,
-    scaledown_window=10 * 60,
+    timeout=MAX_SESSION_SECONDS,
+    min_containers=0,
+    scaledown_window=SCALEDOWN_WINDOW_SECONDS,
     max_containers=1,
     env={
         "HF_HOME": "/data/huggingface",
@@ -206,7 +234,72 @@ def comfyui():
     subprocess.Popen(cmd, cwd=str(COMFYUI_DIR), env=os.environ.copy())
 
 
-@app.function(image=image, gpu=GPU, timeout=20 * 60)
+@app.function(
+    image=image,
+    gpu=GPU,
+    volumes={"/data": data_volume},
+    timeout=MAX_SESSION_SECONDS,
+    min_containers=0,
+    scaledown_window=30,
+    max_containers=1,
+    env={
+        "HF_HOME": "/data/huggingface",
+        "HUGGINGFACE_HUB_CACHE": "/data/huggingface/hub",
+        "TORCH_HOME": "/data/torch",
+        "XDG_CACHE_HOME": "/data/cache",
+        "PYTHONUNBUFFERED": "1",
+    },
+)
+def generate_world(image_name: str = "hyworld2-city.png"):
+    """Run a cheap reconstruction first, then reuse the warm model for the final PLY."""
+    from world_runner import ComfyClient, build_prompt
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    for dirname in ("models", "input", "output", "user"):
+        _persist_dir(dirname)
+
+    process = subprocess.Popen(
+        ["python", "main.py", "--listen", "127.0.0.1", "--port", str(PORT)],
+        cwd=str(COMFYUI_DIR),
+        env=os.environ.copy(),
+    )
+    client = ComfyClient(PORT, DATA_DIR / "output")
+    try:
+        client.wait_until_ready(process)
+        smoke = client.run(
+            build_prompt(
+                image_name=image_name,
+                filename="hyworld2_smoke",
+                target_size=252,
+                use_gsplat=True,
+            ),
+            timeout=20 * 60,
+        )
+        print("SMOKE_WORLD=" + str(smoke), flush=True)
+        final = client.run(
+            build_prompt(
+                image_name=image_name,
+                filename="hyworld2_blender_world",
+                target_size=518,
+                use_gsplat=True,
+            ),
+            timeout=60 * 60,
+        )
+        print("FINAL_WORLD=" + str(final), flush=True)
+        data_volume.commit()
+        return {"smoke": smoke, "final": final}
+    finally:
+        process.terminate()
+
+
+@app.function(
+    image=image,
+    gpu=GPU,
+    timeout=10 * 60,
+    min_containers=0,
+    scaledown_window=30,
+    max_containers=1,
+)
 def import_probe():
     import subprocess
     import sys

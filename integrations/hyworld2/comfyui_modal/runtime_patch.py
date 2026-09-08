@@ -109,3 +109,42 @@ else:
     _s = _s.replace(_old, _new)
     _p.write_text(_s)
 print(f"Applied diffusers Wan rotary device patch ({_count} blocks)")
+
+# Native worldgen has a second decord import. Python 3.12 cannot use the old
+# decord wheel, so use OpenCV for the final frame when decord is unavailable.
+p = ROOT / "hyworld2" / "worldgen" / "src" / "general_utils.py"
+s = p.read_text()
+if "from decord import VideoReader, cpu" in s:
+    s = s.replace(
+        "from decord import VideoReader, cpu",
+        "try:\n    from decord import VideoReader, cpu\nexcept Exception:\n    VideoReader = None\n    cpu = None",
+        1,
+    )
+old = '''def get_last_video_frame(video_path):
+    """decord supports random access, so read the last frame directly by index."""
+    vr = VideoReader(video_path, ctx=cpu(0))
+    last_frame = vr[-1].asnumpy()  # Directly index the last frame; decord seeks internally
+    return last_frame
+'''
+new = '''def get_last_video_frame(video_path):
+    """Read the last frame with decord when available, otherwise OpenCV."""
+    if VideoReader is not None:
+        vr = VideoReader(video_path, ctx=cpu(0))
+        return vr[-1].asnumpy()
+    cap = cv2.VideoCapture(video_path)
+    try:
+        frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if frame_count <= 0:
+            raise RuntimeError(f"Could not read video frame count: {video_path}")
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_count - 1)
+        ok, frame = cap.read()
+        if not ok or frame is None:
+            raise RuntimeError(f"Could not read final video frame: {video_path}")
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    finally:
+        cap.release()
+'''
+if old in s:
+    s = s.replace(old, new, 1)
+p.write_text(s)
+print("Applied HYWorld2 worldgen optional-decord patch")

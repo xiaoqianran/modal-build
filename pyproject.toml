@@ -6,3 +6,11 @@ dependencies = ["modal>=1.5,<2"]
 
 [tool.ruff]
 line-length = 100
+
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["integrations*"]
+namespaces = true

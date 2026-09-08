@@ -1,9 +1,10 @@
 # HY-World 2.0 build artifacts
 
-This integration prepares reproducible artifacts for the future `modal-provider/modal-world`
-HYWorld2 backend. Native CUDA bundles are architecture-specific while keeping one runtime ABI:
-Python 3.11 + CUDA 12.8 + PyTorch 2.7.1. Supported targets are Modal `RTX-PRO-6000`
-(`sm_120`) and `H100` (`sm_90`).
+This integration prepares reproducible artifacts for the `modal-provider/modal-world` HYWorld2
+backend. Native bundles are built per GPU architecture while keeping one Python/CUDA/PyTorch ABI:
+
+- Blackwell: Python 3.11 + CUDA 12.8 + PyTorch 2.7.1 on `RTX-PRO-6000` (`sm_120`).
+- Hopper: Python 3.11 + CUDA 12.8 + PyTorch 2.7.1 on `H100` (`sm_90`).
 
 ## Artifact split
 
@@ -39,10 +40,9 @@ modal run integrations/hyworld2/build/hyworld2_oss_native_sm90.py::build
 modal run integrations/hyworld2/build/hyworld2_flash_attn_sm90.py::build
 ```
 
-GPU builders fail closed on the expected compute capability: `(12, 0)` for Blackwell and `(9, 0)`
-for Hopper. The restricted gsplat builder executes a real CUDA rasterization using the HY-only
-`distloss` and `gauss_masks` arguments. The OSS builder runs a PyTorch3D CUDA KNN and fused-ssim CUDA
-smoke.
+GPU builders fail closed on the target compute capability: `(12, 0)` for Blackwell and `(9, 0)` for
+Hopper. The restricted gsplat builder executes a real CUDA rasterization using the HY-only `distloss`
+and `gauss_masks` arguments. The OSS builder runs a PyTorch3D CUDA KNN and fused-ssim CUDA smoke.
 
 Each build writes to `modal-build-artifacts`:
 
@@ -68,3 +68,10 @@ Public bundles can be installed with `scripts/install_release.sh`. The restricte
 Modal Volume and should later be mounted/installed by the HYWorld2 worker without compiling it again.
 Model checkpoints are stored separately in Modal Volume or a pinned Hugging Face snapshot; they are
 never GitHub Release assets.
+
+## Validated ComfyUI runtime
+
+`comfyui_modal` also contains the cost-controlled Python 3.12 + CUDA 13.0 + PyTorch 2.9.1 runtime
+validated on Modal `RTX-PRO-6000`. Its ABI is recorded in
+`env/hyworld2-comfyui-py312-cu130-torch291-sm120-v1.json`. Do not install the Python 3.11 / CUDA
+12.8 / PyTorch 2.7.1 release wheels into that runtime; native wheel ABIs must match exactly.

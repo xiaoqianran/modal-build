@@ -1,0 +1,20 @@
+{
+  "family": "hyworld2-comfyui",
+  "purpose": "Validated interactive and two-stage PLY generation runtime",
+  "python": "3.12",
+  "cuda": "13.0.3",
+  "torch": "2.9.1",
+  "torchvision": "0.24.1",
+  "cuda_arch": "12.0",
+  "target_gpu": "RTX-PRO-6000",
+  "validated_device": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "validated_outputs": {
+    "smoke_target_size": 252,
+    "final_target_size": 518,
+    "format": "binary_little_endian PLY with Gaussian properties"
+  },
+  "artifact_compatibility": {
+    "hyworld2-py311-cu128-torch271-sm120-v1": false,
+    "reason": "Python, CUDA, and PyTorch ABI must match exactly for native wheels."
+  }
+}

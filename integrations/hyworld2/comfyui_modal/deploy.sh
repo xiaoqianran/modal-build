@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")"
-exec modal deploy modal_app.py --stream-logs
+uv sync --locked
+exec uv run modal deploy modal_app.py --stream-logs
