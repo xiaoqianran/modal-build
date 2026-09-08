@@ -18,7 +18,7 @@ revision, ABI, license files and SHA256 manifest.
 
 | Bundle | Contents | Distribution |
 | --- | --- | --- |
-| `hyworld2-hy-native-...` | custom gsplat + HY navmesh binding | Modal Volume only |
+| `hyworld2-hy-native-...` | custom gsplat + HY navmesh binding | Modal Volume + private GitHub Release backup |
 | `hyworld2-oss-native-...` | PyTorch3D + fused-ssim + SPZ | Volume + GitHub Release |
 | `hyworld2-oss-source-...` | MoGe + pinned nerfview | Modal Volume only (nerfview pinned revision lacks LICENSE file) |
 | `hyworld2-flash-attn-...` | FlashAttention, architecture-specific | Volume + GitHub Release after smoke |
@@ -62,12 +62,39 @@ The publisher reads the manifest and fails closed when `public_release` is false
 orchestrate the same process through `HYWorld2 Build Artifact` after `MODAL_TOKEN_ID` and
 `MODAL_TOKEN_SECRET` repository secrets are configured.
 
+### Private restricted-artifact backup
+
+Restricted HY-derived bundles are mirrored to the **private** repository
+`xiaoqianran/modal-build-private`. The backup tool refuses to upload them unless GitHub reports that
+the destination repository visibility is `PRIVATE`. It verifies the manifest ABI, source revision,
+SHA256 sidecar, ZIP integrity, required HY-WORLD/NOTICE payload and the recorded CUDA smoke before
+publishing or restoring.
+
+```bash
+# Back up both sm90 + sm120 bundles already present in modal-build-artifacts.
+uv run --frozen python -m integrations.hyworld2.private_artifacts backup --all
+
+# New Modal workspace: restore both bundles without compiling CUDA code.
+uv run --frozen python -m integrations.hyworld2.private_artifacts restore --all
+
+# Deployment preflight: use Volume when valid, otherwise restore from private GitHub.
+# This NEVER launches a GPU compiler by default.
+uv run --frozen python -m integrations.hyworld2.private_artifacts ensure --all
+
+# Expensive source-build fallback is opt-in only.
+uv run --frozen python -m integrations.hyworld2.private_artifacts ensure --all --compile-if-missing
+```
+
+`gh` authentication is intentionally kept on the deployment/CI machine; no GitHub PAT is embedded in
+Modal GPU containers. Override the destinations with `HYWORLD2_PRIVATE_ARTIFACT_REPO` and
+`HYWORLD2_ARTIFACT_VOLUME` when needed.
+
 ## Runtime consumption
 
-Public bundles can be installed with `scripts/install_release.sh`. The restricted bundle remains in
-Modal Volume and should later be mounted/installed by the HYWorld2 worker without compiling it again.
-Model checkpoints are stored separately in Modal Volume or a pinned Hugging Face snapshot; they are
-never GitHub Release assets.
+Public bundles can be installed with `scripts/install_release.sh`. Restricted bundles are consumed
+from `modal-build-artifacts`; the private Release is a durable backup used to repopulate a new Modal
+workspace without compiling native CUDA code again. Model checkpoints are stored separately in Modal
+Volume or a pinned Hugging Face snapshot; they are never GitHub Release assets.
 
 ## Validated ComfyUI runtime
 
