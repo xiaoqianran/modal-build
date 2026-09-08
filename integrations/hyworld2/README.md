@@ -21,10 +21,13 @@ revision, ABI, license files and SHA256 manifest.
 | `hyworld2-hy-native-...` | custom gsplat + HY navmesh binding | Modal Volume + private GitHub Release backup |
 | `hyworld2-oss-native-...` | PyTorch3D + fused-ssim + SPZ | Volume + GitHub Release |
 | `hyworld2-oss-source-...` | MoGe + pinned nerfview | Modal Volume only (nerfview pinned revision lacks LICENSE file) |
-| `hyworld2-flash-attn-...` | FlashAttention, architecture-specific | Volume + GitHub Release after smoke |
+| `hyworld2-flash-attn-...` | FlashAttention-2, architecture-specific | Volume + GitHub Release after smoke |
+| `hyworld2-flash-attn3-...-sm90-...` | Experimental FlashAttention-3 for Hopper | Volume + GitHub Release only after H100 smoke + quality gate |
 
 FlashAttention is optional: upstream HYWorld2 falls back to PyTorch SDPA when neither FA3 nor FA2
 is available. The base runtime therefore must not depend on FlashAttention succeeding.
+
+The FA3 bundle is experimental and does **not** switch production Stage3 from FA2. A fixed-seed H100 A/B on `case000` found FA2 repeats bit-identical, while FA3 was close but not bit-exact: 1-reference PSNR 53.92 dB / SSIM 0.99852 and 8-reference PSNR 49.67 dB / SSIM 0.99697. The warmed 8-reference trajectory improved from about 32.95 s (FA2) to 25.12 s (FA3), but the non-exact output means FA3 remains opt-in until a full world/geometry quality gate is approved.
 
 ## Build and smoke
 
@@ -38,6 +41,10 @@ modal run integrations/hyworld2/build/hyworld2_flash_attn_sm120.py::build
 modal run integrations/hyworld2/build/hyworld2_hy_native_sm90.py::build
 modal run integrations/hyworld2/build/hyworld2_oss_native_sm90.py::build
 modal run integrations/hyworld2/build/hyworld2_flash_attn_sm90.py::build
+
+# Experimental FA3 candidate: CUDA compilation is CPU-only; H100 is rented only for smoke.
+modal run integrations/hyworld2/build/hyworld2_flash_attn3_sm90.py::build
+modal run integrations/hyworld2/build/hyworld2_flash_attn3_sm90.py::smoke
 ```
 
 GPU builders fail closed on the target compute capability: `(12, 0)` for Blackwell and `(9, 0)` for
