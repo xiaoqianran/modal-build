@@ -1,0 +1,71 @@
+name: GLM53 B300 Finalize
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      CACHE_TAG: glm53-flash-dflash2-vllm0281rc1-fi0618-sm103a-b300-cache-v1
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Install Modal CLI
+        run: uv tool install 'modal==1.5.5'
+      - name: Seed legacy cache without overwriting warmed files
+        run: modal run integrations/glm53_flash/build/cache_bundle.py --action seed-legacy
+      - name: Inspect unified cache
+        run: modal run integrations/glm53_flash/build/cache_bundle.py --action inspect | tee cache-inspect.log
+      - name: Package unified cache
+        run: modal run integrations/glm53_flash/build/cache_bundle.py --action package | tee cache-package.log
+      - name: Publish cache GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash integrations/glm53_flash/scripts/publish_cache_release.sh "$CACHE_TAG"
+      - name: Checkout GLM repo
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: xiaoqianran/modal-glm53-flash-dflash2-gb300
+          ref: main
+          path: glm
+      - name: Restore release cache on CPU
+        working-directory: glm
+        run: |
+          uv sync --frozen
+          uv run modal run modal_cache.py --action restore --force | tee ../cache-restore.log
+          uv run modal run modal_cache.py --action inspect | tee ../cache-restored-inspect.log
+      - name: Validate runtime on CPU
+        working-directory: glm
+        run: uv run modal run modal_serve.py --action validate | tee ../runtime-validate.log
+      - name: Cold DFlash2 #1
+        working-directory: glm
+        run: uv run modal run modal_serve.py --action benchmark --mode dflash2 2>&1 | tee ../cold-dflash2-1.log
+      - name: Cold DFlash2 #2
+        working-directory: glm
+        run: uv run modal run modal_serve.py --action benchmark --mode dflash2 2>&1 | tee ../cold-dflash2-2.log
+      - name: Cold DFlash2 #3
+        working-directory: glm
+        run: uv run modal run modal_serve.py --action benchmark --mode dflash2 2>&1 | tee ../cold-dflash2-3.log
+      - name: Cold AR-only benchmark
+        working-directory: glm
+        run: uv run modal run modal_serve.py --action benchmark --mode ar 2>&1 | tee ../cold-ar.log
+      - name: Deploy formal scale-to-zero server
+        working-directory: glm
+        run: uv run modal deploy modal_serve.py | tee ../deploy.log
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: glm53-finalize-logs
+          path: |
+            *.log
+          if-no-files-found: warn

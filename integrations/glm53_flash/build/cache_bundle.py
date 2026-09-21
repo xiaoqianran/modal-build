@@ -62,6 +62,10 @@ def _copy_tree(source: Path, destination: Path) -> int:
             continue
         if item.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
+            # seed-legacy is a migration/backfill step. Never overwrite files
+            # produced later by the B300 precompile or production runtime.
+            if target.exists():
+                continue
             shutil.copy2(item, target)
             copied += 1
     return copied
