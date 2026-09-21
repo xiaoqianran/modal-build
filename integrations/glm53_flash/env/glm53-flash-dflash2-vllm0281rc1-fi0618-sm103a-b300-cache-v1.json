@@ -1,0 +1,15 @@
+{
+  "tag": "glm53-flash-dflash2-vllm0281rc1-fi0618-sm103a-b300-cache-v1",
+  "bundle_kind": "glm53-flash-dflash2-b300-compile-cache",
+  "target_gpu": "B300",
+  "cuda_arch": "sm_103a",
+  "vllm_image": "vllm/vllm-openai:glm53-flash",
+  "vllm_version": "0.28.1rc1",
+  "flashinfer_version": "0.6.18",
+  "target_model_revision": "175ae8ce3b5af842b0d0140dbeb43e9cfc557c49",
+  "drafter_model_revision": "bf582e4eacc1810f76656d1811693ff6c6737d2a",
+  "cache_volume": "glm53-flash-compile-cache-v1",
+  "artifact_volume": "modal-build-artifacts",
+  "public_release": true,
+  "contains_model_weights": false
+}
