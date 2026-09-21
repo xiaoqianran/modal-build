@@ -21,46 +21,76 @@ jobs:
           python-version: "3.12"
       - name: Install Modal CLI
         run: uv tool install 'modal==1.5.5'
-      - name: Seed legacy cache without overwriting warmed files
-        run: modal run integrations/glm53_flash/build/cache_bundle.py --action seed-legacy
-      - name: Inspect unified cache
-        run: modal run integrations/glm53_flash/build/cache_bundle.py --action inspect | tee cache-inspect.log
-      - name: Package unified cache
-        run: modal run integrations/glm53_flash/build/cache_bundle.py --action package | tee cache-package.log
-      - name: Publish cache GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: bash integrations/glm53_flash/scripts/publish_cache_release.sh "$CACHE_TAG"
       - name: Checkout GLM repo
         uses: actions/checkout@v7.0.1
         with:
           repository: xiaoqianran/modal-glm53-flash-dflash2-gb300
           ref: main
           path: glm
-      - name: Restore release cache on CPU
-        working-directory: glm
+      - name: Prepare model volume on CPU
+        shell: bash
         run: |
-          uv sync --frozen
-          uv run modal run modal_cache.py --action restore --force | tee ../cache-restore.log
-          uv run modal run modal_cache.py --action inspect | tee ../cache-restored-inspect.log
+          set -euo pipefail
+          modal run glm/modal_pull.py --action inspect | tee model-before.log
+          modal run glm/modal_pull.py --action pull-all | tee model-pull.log
+          modal run glm/modal_pull.py --action inspect | tee model-after.log
+      - name: Seed legacy cache without overwriting warmed files
+        run: modal run integrations/glm53_flash/build/cache_bundle.py --action seed-legacy
+      - name: Precompile B300 cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run integrations/glm53_flash/build/precompile.py::precompile 2>&1 | tee b300-precompile.log
+      - name: Inspect unified cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run integrations/glm53_flash/build/cache_bundle.py --action inspect | tee cache-inspect.log
+      - name: Package unified cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run integrations/glm53_flash/build/cache_bundle.py --action package | tee cache-package.log
+      - name: Publish cache GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash integrations/glm53_flash/scripts/publish_cache_release.sh "$CACHE_TAG"
+      - name: Restore release cache on CPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run glm/modal_cache.py --action restore --force | tee cache-restore.log
+          modal run glm/modal_cache.py --action inspect | tee cache-restored-inspect.log
       - name: Validate runtime on CPU
-        working-directory: glm
-        run: uv run modal run modal_serve.py --action validate | tee ../runtime-validate.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run glm/modal_serve.py --action validate | tee runtime-validate.log
       - name: Cold DFlash2 #1
-        working-directory: glm
-        run: uv run modal run modal_serve.py --action benchmark --mode dflash2 2>&1 | tee ../cold-dflash2-1.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run glm/modal_serve.py --action benchmark --mode dflash2 2>&1 | tee cold-dflash2-1.log
       - name: Cold DFlash2 #2
-        working-directory: glm
-        run: uv run modal run modal_serve.py --action benchmark --mode dflash2 2>&1 | tee ../cold-dflash2-2.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run glm/modal_serve.py --action benchmark --mode dflash2 2>&1 | tee cold-dflash2-2.log
       - name: Cold DFlash2 #3
-        working-directory: glm
-        run: uv run modal run modal_serve.py --action benchmark --mode dflash2 2>&1 | tee ../cold-dflash2-3.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run glm/modal_serve.py --action benchmark --mode dflash2 2>&1 | tee cold-dflash2-3.log
       - name: Cold AR-only benchmark
-        working-directory: glm
-        run: uv run modal run modal_serve.py --action benchmark --mode ar 2>&1 | tee ../cold-ar.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal run glm/modal_serve.py --action benchmark --mode ar 2>&1 | tee cold-ar.log
       - name: Deploy formal scale-to-zero server
-        working-directory: glm
-        run: uv run modal deploy modal_serve.py | tee ../deploy.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          modal deploy glm/modal_serve.py | tee deploy.log
       - name: Upload validation logs
         if: always()
         uses: actions/upload-artifact@v6
