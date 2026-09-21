@@ -1,0 +1,12 @@
+{
+  "tag": "fastsam3d-native-py311-cu121-torch251-sm89-v3",
+  "base_tag": "fastsam3d-native-py311-cu121-torch251-sm89-v2",
+  "python": "3.11",
+  "cuda": "12.1.1",
+  "torch": "2.5.1",
+  "torchvision": "0.20.1",
+  "cuda_arch": "8.9",
+  "target_gpu": "L40S",
+  "artifacts": ["pytorch3d", "gsplat", "nvdiffrast"],
+  "nvdiffrast_revision": "253ac4fcea7de5f396371124af597e6cc957bfae"
+}
