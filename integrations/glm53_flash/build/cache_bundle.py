@@ -9,7 +9,7 @@ from pathlib import Path
 
 import modal
 
-TAG = "glm53-flash-dflash2-vllm0281rc1-fi0618-sm103a-b300-cache-v1"
+TAG = "glm53-flash-dflash2-vllm0281rc1-fi0618-sm103a-b300-cache-v2"
 
 ARTIFACT_VOLUME = "modal-build-artifacts"
 CACHE_VOLUME = "glm53-flash-compile-cache-v1"

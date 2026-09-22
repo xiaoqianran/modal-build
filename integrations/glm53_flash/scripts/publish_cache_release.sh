@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TAG="${1:-glm53-flash-dflash2-vllm0281rc1-fi0618-sm103a-b300-cache-v1}"
+TAG="${1:-glm53-flash-dflash2-vllm0281rc1-fi0618-sm103a-b300-cache-v2}"
 REPO="${REPO:-xiaoqianran/modal-build}"
 VOLUME="${VOLUME:-modal-build-artifacts}"
 DIR="$(mktemp -d)"
