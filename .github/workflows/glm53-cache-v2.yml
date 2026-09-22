@@ -1,0 +1,59 @@
+name: GLM53 Cache V2 Finalize
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  finalize-v2:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      CACHE_TAG: glm53-flash-dflash2-vllm0281rc1-fi0618-sm103a-b300-cache-v2
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: astral-sh/setup-uv@v10.0.1
+        with:
+          python-version: "3.12"
+      - name: Install Modal CLI
+        run: uv tool install 'modal==1.5.5'
+      - name: Checkout GLM repo
+        uses: actions/checkout@v7.0.1
+        with:
+          repository: xiaoqianran/modal-glm53-flash-dflash2-gb300
+          ref: main
+          path: glm
+      - name: Inspect existing unified cache
+        run: modal run integrations/glm53_flash/build/cache_bundle.py --action inspect | tee cache-inspect-v2.log
+      - name: Package unified cache v2
+        run: modal run integrations/glm53_flash/build/cache_bundle.py --action package | tee cache-package-v2.log
+      - name: Publish cache v2 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bash integrations/glm53_flash/scripts/publish_cache_release.sh "$CACHE_TAG"
+      - name: Restore v2 on CPU
+        run: |
+          modal run glm/modal_cache.py --action restore --force | tee cache-restore-v2.log
+          modal run glm/modal_cache.py --action inspect | tee cache-restored-inspect-v2.log
+      - name: Validate runtime on CPU
+        run: modal run glm/modal_serve.py --action validate | tee runtime-validate-v2.log
+      - name: AR cold 2
+        run: modal run glm/modal_serve.py --action benchmark --mode ar 2>&1 | tee cold-ar-2.log
+      - name: AR cold 3
+        run: modal run glm/modal_serve.py --action benchmark --mode ar 2>&1 | tee cold-ar-3.log
+      - name: DFlash2 clean benchmark
+        run: modal run glm/modal_serve.py --action benchmark --mode dflash2 2>&1 | tee benchmark-dflash2-clean.log
+      - name: Deploy formal scale-to-zero server
+        run: modal deploy glm/modal_serve.py | tee deploy-v2.log
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: glm53-cache-v2-logs
+          path: |
+            *.log
+          if-no-files-found: warn
